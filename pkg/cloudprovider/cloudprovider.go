@@ -311,45 +311,97 @@ func (c *CloudProvider) GetSupportedNodeClasses() []status.Object {
 	return []status.Object{&v1.EC2NodeClass{}}
 }
 
+// RepairPolicies are the AWS default repair policies (tracker 9 / 9.5, adapted from DerekFrank/karpenter-provider-aws#15
+// and #16 to the reason-aware matching contract): exactly one policy has an empty ReasonRegex and is the set's global
+// default fallback (it must replace); every other policy matches reasons with a ReasonRegex (".*" = any reason for that
+// condition) and names its Action. When several policies are eligible for one condition, the most disruptive action
+// wins, so a reboot policy only governs until a longer-toleration replace policy on the same condition also matures.
 func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 	return []cloudprovider.RepairPolicy{
 		// Supported Kubelet Node Conditions
 		{
-			ConditionType:      corev1.NodeReady,
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 30 * time.Minute,
+			// The global default fallback. Kubelet is reporting NotReady but is still alive, so a bounded graceful drain
+			// can honor PDBs; the bound keeps repair from the unbounded drain a nil NodeClaim TGP would permit.
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionFalse,
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		{
-			ConditionType:      corev1.NodeReady,
-			ConditionStatus:    corev1.ConditionUnknown,
-			TolerationDuration: 30 * time.Minute,
+			// Ready=Unknown is a lost kubelet heartbeat: the node is unreachable, so a drain cannot complete. Repair
+			// forcefully rather than waiting out a grace period that can never make progress.
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionUnknown,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		// Support Node Monitoring Agent Conditions
 		//
+		// AcceleratedHardwareReady is split by the GPU XID code the Node Monitoring Agent puts in the condition reason
+		// (mirroring MNG's repairRules). ReasonRegex is unanchored (regexp.MatchString); an XID code must not be followed by
+		// another digit, so XID46 doesn't match XID460.
 		{
-			ConditionType:      "AcceleratedHardwareReady",
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 10 * time.Minute,
+			// Reboot-clearable GPU faults (transient XIDs): reboot in place to preserve the scarce GPU instance. If the
+			// fault is still present when the 30m any-reason policy below matures, that replace takes over.
+			ConditionType:          "AcceleratedHardwareReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            `XID(46|48|54|62|63|95|109|110|136|140|143|155|156|158)([^0-9]|$)`,
+			TolerationDuration:     10 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.RebootNode,
 		},
 		{
-			ConditionType:      "StorageReady",
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 30 * time.Minute,
+			// Fatal / uncorrectable GPU errors: replace fast, a reboot would only waste time on dead hardware.
+			ConditionType:          "AcceleratedHardwareReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            `XID(64|74|79|119|120)([^0-9]|$)`,
+			TolerationDuration:     10 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		{
-			ConditionType:      "NetworkingReady",
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 30 * time.Minute,
+			// Any other GPU fault gets a longer 30m confidence delay before replacement.
+			ConditionType:          "AcceleratedHardwareReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		{
-			ConditionType:      "KernelReady",
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 30 * time.Minute,
+			ConditionType:          "StorageReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		{
-			ConditionType:      "ContainerRuntimeReady",
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 30 * time.Minute,
+			ConditionType:          "NetworkingReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+		{
+			ConditionType:          "KernelReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+		{
+			ConditionType:          "ContainerRuntimeReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 	}
 }

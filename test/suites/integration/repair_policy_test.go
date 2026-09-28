@@ -85,9 +85,16 @@ var _ = Describe("Repair Policy", func() {
 			LastTransitionTime: metav1.Time{Time: time.Now().Add(-31 * time.Minute)},
 		}),
 		// Node Monitoring Agent Supported Conditions
+		// An unrecognized GPU reason gets the 30m any-reason policy; known fatal XIDs replace after 10m.
 		Entry("Node AcceleratedHardwareReady False", corev1.NodeCondition{
 			Type:               "AcceleratedHardwareReady",
 			Status:             corev1.ConditionFalse,
+			LastTransitionTime: metav1.Time{Time: time.Now().Add(-31 * time.Minute)},
+		}),
+		Entry("Node AcceleratedHardwareReady False with a fatal XID", corev1.NodeCondition{
+			Type:               "AcceleratedHardwareReady",
+			Status:             corev1.ConditionFalse,
+			Reason:             "NvidiaXID79Error",
 			LastTransitionTime: metav1.Time{Time: time.Now().Add(-11 * time.Minute)},
 		}),
 		Entry("Node StorageReady False", corev1.NodeCondition{
