@@ -34,10 +34,11 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-// Reboot specs drive the reboot node action on real EC2. Repair-driven specs inject the Node Monitoring Agent's
-// AcceleratedHardwareReady condition directly on the Node (as repair_policy_test.go does), so they run on ordinary
-// instances without a GPU or the agent: nothing else owns that condition there, so the kubelet leaves it in place, and
-// it persists across the reboot. A reboot-clearable XID (46) reboots after 10m; a fatal XID (79) replaces.
+// AWS-specific reboot specs. Core's disruption suite runs the provider-agnostic reboot specs on EC2 through
+// upstream-e2etests (--reboot-condition); these add what only EC2 can show: a reboot keeps the same instance, and the
+// AWS policies replace a fatal GPU fault without rebooting. They inject the Node Monitoring Agent's
+// AcceleratedHardwareReady condition directly (as repair_policy_test.go does), so they run on ordinary instances
+// without a GPU or the agent: nothing else owns that condition there, so it persists across the reboot.
 var _ = Describe("Reboot", func() {
 	var dep *appsv1.Deployment
 	var selector labels.Selector
@@ -119,21 +120,6 @@ var _ = Describe("Reboot", func() {
 		return node, nodeClaim, env.GetInstance(node.Name)
 	}
 
-	It("should reboot the EC2 instance in place when a reboot is handed off through the Rebooting condition", func() {
-		node, nodeClaim, instance := provision()
-
-		// Commit a reboot the way any consumer does: the drain bound, then Rebooting=RebootRequested.
-		nodeClaim = env.ExpectExists(nodeClaim).(*karpv1.NodeClaim)
-		nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{karpv1.RebootTerminationGracePeriodAnnotationKey: "5m"})
-		env.ExpectUpdated(nodeClaim)
-		nodeClaim = env.ExpectExists(nodeClaim).(*karpv1.NodeClaim)
-		nodeClaim.StatusConditions().SetTrueWithReason(karpv1.ConditionTypeRebooting, karpv1.RebootReasonRequested, "rebooting for e2e")
-		env.ExpectStatusUpdated(nodeClaim)
-
-		eventuallyExpectRebootSucceeded(nodeClaim, node, node.Status.NodeInfo.BootID)
-		expectInPlace(nodeClaim, node, instance)
-	})
-
 	It("should reboot in place when repair matches a reboot-clearable GPU fault", func() {
 		node, nodeClaim, instance := provision()
 
@@ -181,30 +167,5 @@ var _ = Describe("Reboot", func() {
 		env.EventuallyExpectHealthyPodCount(selector, 1)
 		replacement := env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
 		Expect(replacement.Name).ToNot(Equal(nodeClaim.Name))
-	})
-
-	It("should reboot twice, then replace, when a reboot-clearable GPU fault keeps recurring", func() {
-		node, nodeClaim, instance := provision()
-
-		// Repair's escalation is reboot, reboot, then replace. After each successful reboot the agent reports the fault
-		// again (re-injected with a fresh transition time), so the node is eligible again.
-		bootID := node.Status.NodeInfo.BootID
-		for range 2 {
-			setGPUCondition(node, corev1.ConditionFalse, "NvidiaXID46Error")
-			bootID = eventuallyExpectRebootSucceeded(nodeClaim, node, bootID)
-			Expect(env.GetInstanceByID(aws.ToString(instance.InstanceId)).State.Name).To(Equal(ec2types.InstanceStateNameRunning))
-		}
-		setGPUCondition(node, corev1.ConditionFalse, "NvidiaXID46Error")
-
-		// The third occurrence replaces the node instead of rebooting it again.
-		Eventually(func(g Gomega) {
-			nc := &karpv1.NodeClaim{}
-			if err := env.Client.Get(env, client.ObjectKeyFromObject(nodeClaim), nc); err == nil {
-				g.Expect(nc.StatusConditions().Get(karpv1.ConditionTypeRebooting).Reason).To(Equal(karpv1.RebootReasonSucceeded), "a third reboot was committed")
-				g.Expect(nc.DeletionTimestamp.IsZero()).To(BeFalse(), "not yet replaced")
-			}
-		}).Should(Succeed())
-		env.EventuallyExpectNotFound(nodeClaim, node)
-		env.EventuallyExpectHealthyPodCount(selector, 1)
 	})
 })
