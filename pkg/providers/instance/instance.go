@@ -86,6 +86,7 @@ type Provider interface {
 	Get(context.Context, string, ...Options) (*Instance, error)
 	List(context.Context) ([]*Instance, error)
 	Delete(context.Context, string) error
+	Reboot(context.Context, string, string) error
 	CreateTags(context.Context, string, map[string]string) error
 }
 
@@ -290,6 +291,36 @@ func (p *DefaultProvider) Delete(ctx context.Context, id string) error {
 			})
 			return err
 		}
+	}
+	return nil
+}
+
+// Reboot restarts the instance in place via ec2:RebootInstances (asynchronous — the API queues the
+// reboot and returns without waiting for recovery). operationID identifies the logical reboot; EC2's
+// RebootInstances takes no client token, so in-flight duplicate calls are deduped by EC2 and the
+// reboot controller's restart-safety (pre-reboot bootID compare) covers the rest. Not batched: Beta
+// issues one reboot per NodeClaim.
+func (p *DefaultProvider) Reboot(ctx context.Context, id string, operationID string) error {
+	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("id", id, "operation-id", operationID))
+	// Get serves from the cache when it can and populates it (with the zone) on a miss, so the zonal shift guard
+	// below applies even with a cold cache.
+	out, err := p.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	// During a zonal shift, skip RebootInstances to avoid retry storms against the impaired AZ, as Delete and
+	// CreateTags do. The reboot controller retries within its issuance window and then replaces the node, which
+	// moves the capacity out of the shifted AZ.
+	if out.ZoneID != "" && p.zonalshiftProvider.IsZonalShifted(ctx, out.ZoneID) {
+		return fmt.Errorf("instance %s is in zonally shifted availability zone %s (%s), skipping reboot", id, out.Zone, out.ZoneID)
+	}
+	if _, err := p.ec2api.RebootInstances(ctx, &ec2.RebootInstancesInput{
+		InstanceIds: []string{id},
+	}); err != nil {
+		if awserrors.IsNotFound(err) {
+			return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("rebooting instance, %w", err))
+		}
+		return fmt.Errorf("rebooting instance, %w", err)
 	}
 	return nil
 }
