@@ -89,6 +89,18 @@ spec:
                     memory leak protection, and disruption testing.
                   pattern: ^(([0-9]+(s|m|h))+|Never)$
                   type: string
+                initializationTimeout:
+                  description: |-
+                    InitializationTimeout is the duration the controller will wait for a registered node to become initialized
+                    before deleting the NodeClaim and replacing it, measured from when the current boot began initializing.
+                    A node is initialized once it is Ready, its startup taints are removed, its requested resources are registered,
+                    and its expected DRA drivers have published resource pools. If left undefined, the controller will wait
+                    indefinitely.
+                  pattern: ^(([0-9]+(s|m|h))+|Never)$
+                  type: string
+                  x-kubernetes-validations:
+                    - message: initializationTimeout must be at least 1m
+                      rule: self == 'Never' || duration(self) >= duration('1m')
                 nodeClassRef:
                   description: NodeClassRef is a reference to an object that defines provider specific configuration
                   properties:
