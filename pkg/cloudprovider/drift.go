@@ -66,7 +66,7 @@ func (c *CloudProvider) isNodeClassDrifted(ctx context.Context, nodeClaim *karpv
 	if err != nil {
 		return "", fmt.Errorf("calculating subnet drift, %w", err)
 	}
-	capacityReservationsDrifted, err := c.isCapacityReservationDrifted(ctx, nodeClaim.Status.ProviderID, instance, nodeClass)
+	capacityReservationsDrifted, err := c.isCapacityReservationDrifted(ctx, nodeClaim, instance, nodeClass)
 	if err != nil {
 		return "", fmt.Errorf("calculating capacity reservation drift, %w", err)
 	}
@@ -140,20 +140,25 @@ func (c *CloudProvider) areSecurityGroupsDrifted(ec2Instance *instance.Instance,
 // NOTE: We handle drift dynamically for capacity reservations rather than relying on the offerings inducing drift since
 // a reserved instance may fall back to on-demand. Relying on offerings could result in drift occurring before fallback
 // would cancel it out.
-func (c *CloudProvider) isCapacityReservationDrifted(ctx context.Context, providerID string, i *instance.Instance, nodeClass *v1.EC2NodeClass) (cloudprovider.DriftReason, error) {
-	if i.CapacityReservationDetails == nil {
-		return "", nil
-	}
+func (c *CloudProvider) isCapacityReservationDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim, i *instance.Instance, nodeClass *v1.EC2NodeClass) (cloudprovider.DriftReason, error) {
 	capacityReservationIDs := sets.New(lo.Map(nodeClass.Status.CapacityReservations, func(cr v1.CapacityReservation, _ int) string { return cr.ID })...)
-	if capacityReservationIDs.Has(i.CapacityReservationDetails.ID) {
+	drifted := func(i *instance.Instance) bool {
+		if i.CapacityReservationDetails == nil || capacityReservationIDs.Has(i.CapacityReservationDetails.ID) {
+			return false
+		}
+		// An in-place re-target Karpenter hasn't labeled reserved stays on-demand to us, as it was before the migration gate.
+		return i.CapacityReservationState.Preference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly ||
+			nodeClaim.Labels[cloudprovider.ReservationIDLabel] == i.CapacityReservationDetails.ID
+	}
+	if !drifted(i) {
 		return "", nil
 	}
 	// skip the instance type cache to get up-to-date instance info
-	i, err := c.getInstance(ctx, providerID, instance.SkipCache)
+	i, err := c.getInstance(ctx, nodeClaim.Status.ProviderID, instance.SkipCache)
 	if err != nil {
 		return "", err
 	}
-	if i.CapacityReservationDetails != nil && !capacityReservationIDs.Has(i.CapacityReservationDetails.ID) {
+	if drifted(i) {
 		return CapacityReservationDrift, nil
 	}
 	return "", nil

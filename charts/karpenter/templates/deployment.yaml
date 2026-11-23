@@ -137,7 +137,7 @@ spec:
             - name: FEATURE_GATES
               value: "ReservedCapacity={{ .Values.settings.featureGates.reservedCapacity }},SpotToSpotConsolidation={{ .Values.settings.featureGates.spotToSpotConsolidation }},NodeRepair={{ .Values.settings.featureGates.nodeRepair }},NodeOverlay={{ .Values.settings.featureGates.nodeOverlay }},StaticCapacity={{ .Values.settings.featureGates.staticCapacity }},CapacityBuffer={{ .Values.settings.featureGates.capacityBuffer }},TerminateFirstDrift={{ .Values.settings.featureGates.terminateFirstDrift }},TerminateFirstRepair={{ .Values.settings.featureGates.terminateFirstRepair }},PodDeletionCostManagement={{ .Values.settings.featureGates.podDeletionCostManagement }},PredictionEnabled={{ .Values.settings.featureGates.predictionEnabled }}"
             - name: AWS_FEATURE_GATES
-              value: "NodeClassCEL={{ .Values.settings.awsFeatureGates.nodeClassCEL }},DRANVIDIAGPU={{ $dra.draNVIDIAGPU }},DRAEFA={{ $dra.draEFA }},RebootForRepair={{ .Values.settings.awsFeatureGates.rebootForRepair }}"
+              value: "NodeClassCEL={{ .Values.settings.awsFeatureGates.nodeClassCEL }},DRANVIDIAGPU={{ $dra.draNVIDIAGPU }},DRAEFA={{ $dra.draEFA }},RebootForRepair={{ .Values.settings.awsFeatureGates.rebootForRepair }},ReservedCapacityMigration={{ .Values.settings.awsFeatureGates.reservedCapacityMigration }}"
           {{- with .Values.settings.batchMaxDuration }}
             - name: BATCH_MAX_DURATION
               value: "{{ tpl (toString .) $ }}"

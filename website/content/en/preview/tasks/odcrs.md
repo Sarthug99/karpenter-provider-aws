@@ -122,6 +122,33 @@ From the [AWS docs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/interrup
 
 Karpenter will begin draining nodes launched for IODCRs when the 2-minute interruption warning is recieved.
 
+## Migrating Running Nodes into Capacity Reservations
+
+<i class="fa-solid fa-circle-info"></i> <b>Feature State: </b> [Alpha]({{<ref "../reference/settings#aws-specific-feature-gates" >}})
+
+With the `ReservedCapacityMigration` [AWS feature gate]({{<ref "../reference/settings#aws-specific-feature-gates" >}}) enabled, Karpenter moves running nodes into a capacity reservation without replacing them.
+It uses [ModifyInstanceCapacityReservationAttributes](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyInstanceCapacityReservationAttributes.html), which needs the `ec2:ModifyInstanceCapacityReservationAttributes` permission on the controller role.
+The gate has no effect without the `ReservedCapacity` feature gate.
+
+Karpenter considers two kinds of nodes:
+- on-demand nodes that don't target any capacity reservation
+- nodes whose capacity reservation expired or was cancelled, after Karpenter relabels them `on-demand`
+
+A node is moved only when all of the following hold:
+- its NodePool requirements allow `karpenter.sh/capacity-type: reserved` and the reservation's labels
+- every pod on it, including DaemonSet pods and excluding static pods, can run on a reserved node in that reservation. Only required node affinity and `nodeSelector` are checked; preferred affinity doesn't block a move.
+- the reservation is in the EC2NodeClass's `status.capacityReservations`, is a `default` (not capacity block or interruptible) reservation, matches the node's instance type, zone, platform and tenancy, and has a free slot
+
+Karpenter re-targets the instance and keeps the node labeled `on-demand` until EC2 reports it covered by the reservation. Coverage is usually reported within seconds.
+It then labels the NodeClaim and Node `reserved`, with `karpenter.k8s.aws/capacity-reservation-id`, `karpenter.k8s.aws/capacity-reservation-type: default` and `karpenter.k8s.aws/capacity-reservation-interruptible: false`.
+No node is drained or replaced. Karpenter checks the NodePool, the pods and the EC2NodeClass again before relabeling.
+If one of them no longer allows the reservation, for example because a pod requiring `on-demand` was scheduled while the move was pending, the node stays labeled `on-demand` and Karpenter emits a `CapacityReservationMigrationNotRelabeled` event. Karpenter relabels it later if they allow the reservation again.
+
+{{% alert title="Warning" color="warning" %}}
+The move can't be undone. Once an instance targets a capacity reservation, it can't return to on-demand without being replaced.
+Nodes launched before `ReservedCapacity` was enabled have the `open` capacity reservation preference and are never moved.
+{{% /alert %}}
+
 ## Migrating From Previous Versions
 
 Although it was not natively supported, it was possible to utilize ODCRs on previous versions of Karpenter.

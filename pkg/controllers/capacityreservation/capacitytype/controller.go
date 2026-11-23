@@ -62,6 +62,11 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
+	// List NodeClaims before instances so a reserved label written after an older instance snapshot is never demoted.
+	ncs := &karpv1.NodeClaimList{}
+	if err := c.kubeClient.List(ctx, ncs); err != nil {
+		return reconciler.Result{}, fmt.Errorf("listing nodeclaims, %w", err)
+	}
 	cpNodeClaims, err := c.cp.List(ctx)
 	if err != nil {
 		return reconciler.Result{}, fmt.Errorf("listing instance types, %w", err)
@@ -69,10 +74,6 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	providerIDsToCPNodeClaims := lo.SliceToMap(cpNodeClaims, func(nc *karpv1.NodeClaim) (string, *karpv1.NodeClaim) {
 		return nc.Status.ProviderID, nc
 	})
-	ncs := &karpv1.NodeClaimList{}
-	if err := c.kubeClient.List(ctx, ncs); err != nil {
-		return reconciler.Result{}, fmt.Errorf("listing nodeclaims, %w", err)
-	}
 	updatedNodeClaims := sets.New[string]()
 	var errs []error
 	for i := range ncs.Items {

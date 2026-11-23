@@ -165,6 +165,26 @@ Resources:
                   "aws:ResourceTag/karpenter.sh/nodepool": "*"
                 }
               }
+            },
+            {
+              "Sid": "AllowScopedInstanceCapacityReservationModification",
+              "Effect": "Allow",
+              "Resource": "arn:${AWS::Partition}:ec2:${AWS::Region}:*:instance/*",
+              "Action": "ec2:ModifyInstanceCapacityReservationAttributes",
+              "Condition": {
+                "StringEquals": {
+                  "aws:ResourceTag/kubernetes.io/cluster/${ClusterName}": "owned"
+                },
+                "StringLike": {
+                  "aws:ResourceTag/karpenter.sh/nodepool": "*"
+                }
+              }
+            },
+            {
+              "Sid": "AllowCapacityReservationTargetForModification",
+              "Effect": "Allow",
+              "Resource": "arn:${AWS::Partition}:ec2:${AWS::Region}:*:capacity-reservation/*",
+              "Action": "ec2:ModifyInstanceCapacityReservationAttributes"
             }
           ]
         }

@@ -291,6 +291,40 @@ The AllowScopedDeletion Sid allows [TerminateInstances](https://docs.aws.amazon.
 }
 ```
 
+#### AllowScopedInstanceCapacityReservationModification
+
+The AllowScopedInstanceCapacityReservationModification Sid allows [ModifyInstanceCapacityReservationAttributes](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyInstanceCapacityReservationAttributes.html) on instances, provided that `karpenter.sh/nodepool` and `kubernetes.io/cluster/${ClusterName}` tags are set. Karpenter uses it to move a running node into a capacity reservation its EC2NodeClass selects, only with the `ReservedCapacityMigration` AWS feature gate enabled. The scoping ensures Karpenter can only re-target instances that are associated with it.
+
+```json
+{
+  "Sid": "AllowScopedInstanceCapacityReservationModification",
+  "Effect": "Allow",
+  "Resource": "arn:${AWS::Partition}:ec2:${AWS::Region}:*:instance/*",
+  "Action": "ec2:ModifyInstanceCapacityReservationAttributes",
+  "Condition": {
+    "StringEquals": {
+      "aws:ResourceTag/kubernetes.io/cluster/${ClusterName}": "owned"
+    },
+    "StringLike": {
+      "aws:ResourceTag/karpenter.sh/nodepool": "*"
+    }
+  }
+}
+```
+
+#### AllowCapacityReservationTargetForModification
+
+The AllowCapacityReservationTargetForModification Sid allows `ModifyInstanceCapacityReservationAttributes` to name a `capacity-reservation` as the instance's new target. Karpenter only targets capacity reservations selected by an EC2NodeClass's `capacityReservationSelectorTerms`.
+
+```json
+{
+  "Sid": "AllowCapacityReservationTargetForModification",
+  "Effect": "Allow",
+  "Resource": "arn:${AWS::Partition}:ec2:${AWS::Region}:*:capacity-reservation/*",
+  "Action": "ec2:ModifyInstanceCapacityReservationAttributes"
+}
+```
+
 ### KarpenterControllerIAMIntegrationPolicy
 
 The `IAMIntegrationPolicy` manages IAM instance profile operations. Given a cluster name of `bob-karpenter-demo`, this policy would be named: `KarpenterControllerIAMIntegrationPolicy-bob-karpenter-demo`

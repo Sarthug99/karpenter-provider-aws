@@ -24,6 +24,7 @@ import (
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/clock"
 
 	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
@@ -112,6 +113,9 @@ type availabilityCache struct {
 	availabilityCache *cache.Cache
 	terminationCache  *cache.Cache // instance IDs whose slot was already returned
 	clk               clock.Clock
+	// EC2's AvailableInstanceCount lags in-place migrations, so these slots are held until a later sync includes them.
+	pendingMigrations map[string]sets.Set[string]     // reservation ID -> re-targeted, uncovered instance IDs
+	migrated          map[string]map[string]time.Time // reservation ID -> covered instance ID -> coverage time
 }
 
 type availabilityCacheEntry struct {
@@ -128,6 +132,47 @@ func (c *availabilityCache) syncAvailability(availability map[string]int) {
 			count:    count,
 			syncTime: now,
 		})
+		for instanceID, coveredAt := range c.migrated[id] {
+			if coveredAt.Before(now) {
+				delete(c.migrated[id], instanceID)
+			}
+		}
+		if len(c.migrated[id]) == 0 {
+			delete(c.migrated, id)
+		}
+	}
+}
+
+func (c *availabilityCache) SetPendingMigrations(pending map[string]sets.Set[string]) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pendingMigrations = map[string]sets.Set[string]{}
+	for id, instanceIDs := range pending {
+		if instanceIDs.Len() != 0 {
+			c.pendingMigrations[id] = instanceIDs.Clone()
+		}
+	}
+}
+
+// ResetMigrations clears the migration ledger; tests use it between cases.
+func (c *availabilityCache) ResetMigrations() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pendingMigrations = map[string]sets.Set[string]{}
+	c.migrated = map[string]map[string]time.Time{}
+}
+
+func (c *availabilityCache) MarkMigrated(reservationID, instanceID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.migrated == nil {
+		c.migrated = map[string]map[string]time.Time{}
+	}
+	if _, ok := c.migrated[reservationID]; !ok {
+		c.migrated[reservationID] = map[string]time.Time{}
+	}
+	if _, ok := c.migrated[reservationID][instanceID]; !ok {
+		c.migrated[reservationID][instanceID] = c.clk.Now()
 	}
 }
 
@@ -177,7 +222,14 @@ func (c *availabilityCache) GetAvailableInstanceCount(reservationID string) int 
 	if !ok {
 		return 0
 	}
-	return entry.(*availabilityCacheEntry).count
+	held := c.pendingMigrations[reservationID].Len()
+	for instanceID := range c.migrated[reservationID] {
+		// Don't double count an instance that is both pending (stale annotation) and covered.
+		if !c.pendingMigrations[reservationID].Has(instanceID) {
+			held++
+		}
+	}
+	return max(0, entry.(*availabilityCacheEntry).count-held)
 }
 
 // SetAvailableInstanceCount forces the cached availability for a reservation. The launch path uses it to zero a

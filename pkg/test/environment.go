@@ -301,6 +301,7 @@ func (env *Environment) Reset() {
 	env.SSMCache.Flush()
 	env.DiscoveredCapacityCache.Flush()
 	env.CapacityReservationCache.Flush()
+	env.CapacityReservationProvider.ResetMigrations()
 	env.PlacementGroupCache.Flush()
 	env.ValidationCache.Flush()
 	env.RecreationCache.Flush()

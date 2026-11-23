@@ -24,6 +24,7 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
@@ -39,6 +40,10 @@ type Provider interface {
 	MarkLaunched(string)
 	// MarkTerminated returns instanceID's slot to the reservation. Repeat calls for the same instance are no-ops.
 	MarkTerminated(reservationID, instanceID string)
+	// SetPendingMigrations replaces the set of instances re-targeted in place at each reservation but not yet covered.
+	SetPendingMigrations(map[string]sets.Set[string])
+	// MarkMigrated holds instanceID's slot against the reservation until the next EC2 sync, which then includes it.
+	MarkMigrated(reservationID, instanceID string)
 }
 
 type DefaultProvider struct {
@@ -61,6 +66,8 @@ func NewProvider(
 			availabilityCache: reservationAvailabilityCache,
 			terminationCache:  cache.New(terminatedInstanceTTL, time.Minute),
 			clk:               clk,
+			pendingMigrations: map[string]sets.Set[string]{},
+			migrated:          map[string]map[string]time.Time{},
 		},
 		ec2api:           ec2api,
 		clk:              clk,

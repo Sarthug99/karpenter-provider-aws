@@ -51,6 +51,16 @@ type Instance struct {
 	CapacityReservationDetails *CapacityReservationDetails
 	Tenancy                    string
 	PartitionNumber            *int32
+	CapacityReservationState   CapacityReservationState
+}
+
+// CapacityReservationState is the raw EC2 reservation state of an instance, used by in-place reservation migration.
+type CapacityReservationState struct {
+	Preference ec2types.CapacityReservationPreference
+	TargetID   string
+	CoveringID string
+	Platform   string
+	Lifecycle  ec2types.InstanceLifecycleType
 }
 
 type CapacityReservationDetails struct {
@@ -95,7 +105,23 @@ func NewInstance(ctx context.Context, instance ec2types.Instance) *Instance {
 		CapacityReservationDetails: capacityReservationDetails,
 		Tenancy:                    tenancyFromInstance(instance),
 		PartitionNumber:            partitionNumberFromInstance(instance),
+		CapacityReservationState:   capacityReservationStateFromInstance(instance),
 	}
+}
+
+func capacityReservationStateFromInstance(instance ec2types.Instance) CapacityReservationState {
+	state := CapacityReservationState{
+		CoveringID: lo.FromPtr(instance.CapacityReservationId),
+		Platform:   lo.FromPtr(instance.PlatformDetails),
+		Lifecycle:  instance.InstanceLifecycle,
+	}
+	if spec := instance.CapacityReservationSpecification; spec != nil {
+		state.Preference = spec.CapacityReservationPreference
+		if spec.CapacityReservationTarget != nil {
+			state.TargetID = lo.FromPtr(spec.CapacityReservationTarget.CapacityReservationId)
+		}
+	}
+	return state
 }
 
 func partitionNumberFromInstance(instance ec2types.Instance) *int32 {
@@ -114,9 +140,14 @@ func capacityTypeFromInstance(ctx context.Context, instance ec2types.Instance) s
 	if instance.SpotInstanceRequestId != nil {
 		return karpv1.CapacityTypeSpot
 	}
-	if karpopts.FromContext(ctx).FeatureGates.ReservedCapacity &&
-		instance.CapacityReservationId != nil &&
-		instance.CapacityReservationSpecification.CapacityReservationPreference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly {
+	if !karpopts.FromContext(ctx).FeatureGates.ReservedCapacity || instance.CapacityReservationId == nil || instance.CapacityReservationSpecification == nil {
+		return karpv1.CapacityTypeOnDemand
+	}
+	if instance.CapacityReservationSpecification.CapacityReservationPreference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly {
+		return karpv1.CapacityTypeReserved
+	}
+	// Ungated: a migrated instance stays reserved after the migration gate is turned off; open-ODCR instances stay on-demand.
+	if target := instance.CapacityReservationSpecification.CapacityReservationTarget; target != nil && lo.FromPtr(target.CapacityReservationId) == *instance.CapacityReservationId {
 		return karpv1.CapacityTypeReserved
 	}
 	return karpv1.CapacityTypeOnDemand

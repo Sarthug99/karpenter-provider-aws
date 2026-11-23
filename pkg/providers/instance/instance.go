@@ -34,6 +34,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
@@ -81,6 +82,9 @@ var (
 	}
 )
 
+// ErrModifyNotAttempted means ModifyCapacityReservationTarget failed before calling EC2, so nothing changed.
+var ErrModifyNotAttempted = errors.New("capacity reservation modification not attempted")
+
 type Provider interface {
 	Create(context.Context, *v1.EC2NodeClass, *karpv1.NodeClaim, map[string]string, []*cloudprovider.InstanceType) (*Instance, error)
 	// Retrieves instance from a cache with no TTL or EC2. This defaults to cache, use SkipCache to force an EC2 lookup.
@@ -88,6 +92,8 @@ type Provider interface {
 	List(context.Context) ([]*Instance, error)
 	Delete(context.Context, string) error
 	Reboot(context.Context, string, string) error
+	// ModifyCapacityReservationTarget re-targets a running instance at a capacity reservation in place.
+	ModifyCapacityReservationTarget(context.Context, string, string) error
 	CreateTags(context.Context, string, map[string]string) error
 }
 
@@ -348,6 +354,33 @@ func (p *DefaultProvider) Reboot(ctx context.Context, id string, operationID str
 			return cloudprovider.NewNodeRebootFailedError(fmt.Errorf("rebooting instance, %w", err))
 		}
 		return fmt.Errorf("rebooting instance, %w", err)
+	}
+	return nil
+}
+
+// ModifyCapacityReservationTarget sets only a target (no preference), the transition EC2 allows on a running instance.
+func (p *DefaultProvider) ModifyCapacityReservationTarget(ctx context.Context, id string, capacityReservationID string) error {
+	out, err := p.Get(ctx, id)
+	if err != nil {
+		if cloudprovider.IsNodeClaimNotFoundError(err) {
+			return err
+		}
+		return fmt.Errorf("%w, %w", ErrModifyNotAttempted, err)
+	}
+	if out.ZoneID != "" && p.zonalshiftProvider.IsZonalShifted(ctx, out.ZoneID) {
+		return fmt.Errorf("%w, instance %s is in zonally shifted availability zone %s (%s)", ErrModifyNotAttempted, id, out.Zone, out.ZoneID)
+	}
+	if _, err := p.ec2api.ModifyInstanceCapacityReservationAttributes(ctx, &ec2.ModifyInstanceCapacityReservationAttributesInput{
+		InstanceId: lo.ToPtr(id),
+		CapacityReservationSpecification: &ec2types.CapacityReservationSpecification{
+			CapacityReservationTarget: &ec2types.CapacityReservationTarget{CapacityReservationId: lo.ToPtr(capacityReservationID)},
+		},
+	}); err != nil {
+		// Only a missing instance means the NodeClaim is gone; a missing reservation is a client error.
+		if apiErr, ok := lo.ErrorsAs[smithy.APIError](err); ok && apiErr.ErrorCode() == "InvalidInstanceID.NotFound" {
+			return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("modifying instance capacity reservation attributes, %w", err))
+		}
+		return fmt.Errorf("modifying instance capacity reservation attributes, %w", err)
 	}
 	return nil
 }

@@ -62,6 +62,23 @@ cat << EOF > controller-policy.json
             "Sid": "ConditionalEC2Termination"
         },
         {
+            "Action": "ec2:ModifyInstanceCapacityReservationAttributes",
+            "Condition": {
+                "StringLike": {
+                    "ec2:ResourceTag/karpenter.sh/nodepool": "*"
+                }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:${AWS_PARTITION}:ec2:${AWS_REGION}:*:instance/*",
+            "Sid": "ConditionalEC2CapacityReservationModification"
+        },
+        {
+            "Action": "ec2:ModifyInstanceCapacityReservationAttributes",
+            "Effect": "Allow",
+            "Resource": "arn:${AWS_PARTITION}:ec2:${AWS_REGION}:*:capacity-reservation/*",
+            "Sid": "AllowCapacityReservationTargetForModification"
+        },
+        {
             "Effect": "Allow",
             "Action": "iam:PassRole",
             "Resource": "arn:${AWS_PARTITION}:iam::${AWS_ACCOUNT_ID}:role/KarpenterNodeRole-${CLUSTER_NAME}",

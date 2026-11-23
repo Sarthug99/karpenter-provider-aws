@@ -17,10 +17,12 @@ package capacityreservation_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/samber/lo"
+	"k8s.io/apimachinery/pkg/util/sets"
 	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 
@@ -127,6 +129,54 @@ var _ = Describe("Capacity Reservation Provider", func() {
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-test")).To(Equal(1))
 			awsEnv.CapacityReservationProvider.MarkTerminated("cr-test", "i-dedupe-2")
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-test")).To(Equal(2))
+		})
+	})
+	Context("Migration Ledger", func() {
+		BeforeEach(func() {
+			awsEnv.CapacityReservationProvider.ResetMigrations()
+			awsEnv.CapacityReservationCache.Flush()
+		})
+		AfterEach(func() {
+			awsEnv.CapacityReservationProvider.ResetMigrations()
+		})
+		It("should hold pending migrations against a reservation's count", func() {
+			awsEnv.CapacityReservationProvider.SetAvailableInstanceCount("cr-test", 3)
+			awsEnv.CapacityReservationProvider.SetPendingMigrations(map[string]sets.Set[string]{"cr-test": sets.New("i-1", "i-2")})
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-test")).To(Equal(1))
+			awsEnv.CapacityReservationProvider.SetPendingMigrations(map[string]sets.Set[string]{"cr-test": sets.New("i-1", "i-2", "i-3", "i-4")})
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-test")).To(Equal(0))
+			awsEnv.CapacityReservationProvider.SetPendingMigrations(nil)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-test")).To(Equal(3))
+		})
+		It("should keep holding pending migrations across a stale EC2 sync", func() {
+			_, err := awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-m5.large-1a-1"})
+			Expect(err).ToNot(HaveOccurred())
+			awsEnv.CapacityReservationProvider.SetPendingMigrations(map[string]sets.Set[string]{"cr-m5.large-1a-1": sets.New("i-1")})
+			awsEnv.CapacityReservationCache.Flush()
+			_, err = awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-m5.large-1a-1"})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-m5.large-1a-1")).To(Equal(9))
+		})
+		It("should hold a migrated instance until a later EC2 sync and not double count it", func() {
+			_, err := awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-m5.large-1a-1"})
+			Expect(err).ToNot(HaveOccurred())
+			awsEnv.CapacityReservationProvider.SetPendingMigrations(map[string]sets.Set[string]{"cr-m5.large-1a-1": sets.New("i-1")})
+			awsEnv.CapacityReservationProvider.MarkMigrated("cr-m5.large-1a-1", "i-1")
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-m5.large-1a-1")).To(Equal(9))
+			awsEnv.CapacityReservationProvider.SetPendingMigrations(nil)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-m5.large-1a-1")).To(Equal(9))
+
+			// A sync at the coverage instant may predate EC2 counting the instance, so it keeps the hold.
+			awsEnv.CapacityReservationCache.Flush()
+			_, err = awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-m5.large-1a-1"})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-m5.large-1a-1")).To(Equal(9))
+
+			awsEnv.Clock.Step(time.Minute)
+			awsEnv.CapacityReservationCache.Flush()
+			_, err = awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-m5.large-1a-1"})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-m5.large-1a-1")).To(Equal(10))
 		})
 	})
 })

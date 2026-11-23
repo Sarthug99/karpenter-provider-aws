@@ -297,3 +297,8 @@ settings:
     # Setting this to true will make node repair reboot a node in place for reboot-clearable GPU faults instead of
     # replacing it. Requires the ec2:RebootInstances permission.
     rebootForRepair: false
+    # -- reservedCapacityMigration is ALPHA and is disabled by default. It has no effect without the reservedCapacity feature gate.
+    # Setting this to true will move running on-demand nodes, and nodes whose capacity reservation expired or was cancelled,
+    # into a capacity reservation their EC2NodeClass selects, without replacing them. The move can't be undone.
+    # Requires the ec2:ModifyInstanceCapacityReservationAttributes permission.
+    reservedCapacityMigration: false

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	stdatomic "sync/atomic"
 	"time"
 
 	"github.com/Pallinder/go-randomdata"
@@ -73,6 +74,10 @@ type EC2Behavior struct {
 	InsufficientCapacityPools            atomic.Slice[CapacityPool]
 	NextError                            AtomicError
 
+	ModifyInstanceCapacityReservationAttributesBehavior MockedFunction[ec2.ModifyInstanceCapacityReservationAttributesInput, ec2.ModifyInstanceCapacityReservationAttributesOutput]
+	// ModifyInstanceCapacityReservationCoverage makes the fake Modify also set CapacityReservationId (no coverage lag).
+	ModifyInstanceCapacityReservationCoverage stdatomic.Bool
+
 	Subnets                               sync.Map
 	LaunchTemplates                       sync.Map
 	launchTemplatesToCapacityReservations sync.Map // map[lt-name]cr-id
@@ -105,6 +110,8 @@ func (e *EC2API) Reset() {
 	e.CreateFleetBehavior.Reset()
 	e.TerminateInstancesBehavior.Reset()
 	e.RebootInstancesBehavior.Reset()
+	e.ModifyInstanceCapacityReservationAttributesBehavior.Reset()
+	e.ModifyInstanceCapacityReservationCoverage.Store(false)
 	e.DescribeInstancesBehavior.Reset()
 	e.CreateLaunchTemplateBehavior.Reset()
 	e.CalledWithDescribeImagesInput.Reset()
@@ -277,6 +284,30 @@ func (e *EC2API) RebootInstances(_ context.Context, input *ec2.RebootInstancesIn
 	return e.RebootInstancesBehavior.Invoke(input, func(input *ec2.RebootInstancesInput) (*ec2.RebootInstancesOutput, error) {
 		// A reboot preserves the instance, so unlike TerminateInstances the fake leaves e.Instances intact.
 		return &ec2.RebootInstancesOutput{}, nil
+	})
+}
+
+func (e *EC2API) ModifyInstanceCapacityReservationAttributes(_ context.Context, input *ec2.ModifyInstanceCapacityReservationAttributesInput, _ ...func(*ec2.Options)) (*ec2.ModifyInstanceCapacityReservationAttributesOutput, error) {
+	return e.ModifyInstanceCapacityReservationAttributesBehavior.Invoke(input, func(input *ec2.ModifyInstanceCapacityReservationAttributesInput) (*ec2.ModifyInstanceCapacityReservationAttributesOutput, error) {
+		raw, ok := e.Instances.Load(lo.FromPtr(input.InstanceId))
+		if !ok {
+			return nil, &smithy.GenericAPIError{Code: "InvalidInstanceID.NotFound", Message: fmt.Sprintf("The instance ID '%s' does not exist", lo.FromPtr(input.InstanceId))}
+		}
+		instance := raw.(ec2types.Instance)
+		spec := input.CapacityReservationSpecification
+		resp := &ec2types.CapacityReservationSpecificationResponse{}
+		if spec != nil && spec.CapacityReservationTarget != nil && spec.CapacityReservationTarget.CapacityReservationId != nil {
+			resp.CapacityReservationTarget = &ec2types.CapacityReservationTargetResponse{CapacityReservationId: spec.CapacityReservationTarget.CapacityReservationId}
+			if e.ModifyInstanceCapacityReservationCoverage.Load() {
+				instance.CapacityReservationId = spec.CapacityReservationTarget.CapacityReservationId
+			}
+		}
+		if spec != nil {
+			resp.CapacityReservationPreference = spec.CapacityReservationPreference
+		}
+		instance.CapacityReservationSpecification = resp
+		e.Instances.Store(lo.FromPtr(instance.InstanceId), instance)
+		return &ec2.ModifyInstanceCapacityReservationAttributesOutput{Return: lo.ToPtr(true)}, nil
 	})
 }
 

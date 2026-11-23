@@ -1083,6 +1083,61 @@ Size of the request batch per batcher
 - Dimensions:
   - `batcher` — The name of the request batcher the metric was recorded for, e.g. `create_fleet`, `terminate_instances`.
 
+## Capacity Reservation Migration Metrics
+
+### `karpenter_capacity_reservation_migration_stalled`
+Number of pending nodes whose coverage has taken longer than 30 minutes.
+- Type: [Gauge](https://prometheus.io/docs/concepts/metric_types/#gauge)
+- Stability Level: ALPHA
+
+### `karpenter_capacity_reservation_migration_pending`
+Number of nodes re-targeted at a capacity reservation that EC2 doesn't report covered yet.
+- Type: [Gauge](https://prometheus.io/docs/concepts/metric_types/#gauge)
+- Stability Level: ALPHA
+- Dimensions:
+  - `capacity_reservation_id` — The ID of the target capacity reservation.
+
+### `karpenter_capacity_reservation_migration_ineligible`
+Number of on-demand or orphaned nodes not migrated in the last pass, by reason.
+- Type: [Gauge](https://prometheus.io/docs/concepts/metric_types/#gauge)
+- Stability Level: ALPHA
+- Dimensions:
+  - `reason` — Why a node is not eligible for migration.
+    - `preference_open` — The instance has capacity reservation preference open, which EC2 can't re-target.
+    - `pod_incompatible` — A pod on the node requires labels the reserved node wouldn't have.
+    - `nodepool_incompatible` — The NodePool requirements don't allow the reserved labels.
+    - `no_capacity` — Every compatible capacity reservation is full.
+    - `no_compatible_cr` — No capacity reservation selected by the EC2NodeClass matches the instance.
+
+### `karpenter_capacity_reservation_migration_coverage_duration_seconds`
+Time from re-targeting a node at a capacity reservation to EC2 reporting it covered.
+- Type: [Histogram](https://prometheus.io/docs/concepts/metric_types/#histogram)
+- Stability Level: ALPHA
+
+### `karpenter_capacity_reservation_migration_completed_total`
+Number of nodes relabeled reserved after EC2 reported them covered by the target capacity reservation.
+- Type: [Counter](https://prometheus.io/docs/concepts/metric_types/#counter)
+- Stability Level: ALPHA
+- Dimensions:
+  - `case` — Why the node is being migrated.
+    - `on_demand` — An on-demand node with no capacity reservation target.
+    - `orphaned` — A node whose targeted capacity reservation expired or was canceled.
+
+### `karpenter_capacity_reservation_migration_attempts_total`
+Number of ModifyInstanceCapacityReservationAttributes calls made to move a running node into a capacity reservation.
+- Type: [Counter](https://prometheus.io/docs/concepts/metric_types/#counter)
+- Stability Level: ALPHA
+- Dimensions:
+  - `result` — The outcome of the ModifyInstanceCapacityReservationAttributes call.
+    - `success` — EC2 accepted the new target.
+    - `client_error` — EC2 rejected the request, e.g. the transition or target is not allowed.
+    - `unauthorized` — The controller role lacks ec2:ModifyInstanceCapacityReservationAttributes.
+    - `throttled` — EC2 throttled the request.
+    - `error` — Any other error.
+  - `case` — Why the node is being migrated.
+    - `on_demand` — An on-demand node with no capacity reservation target.
+    - `orphaned` — A node whose targeted capacity reservation expired or was canceled.
+
 ## Controller Runtime Metrics
 
 ### `controller_runtime_terminal_reconcile_errors_total`

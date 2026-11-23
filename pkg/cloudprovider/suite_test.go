@@ -1504,6 +1504,26 @@ var _ = Describe("CloudProvider", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(isDrifted).To(Equal(cloudprovider.CapacityReservationDrift))
 		})
+		It("should only drift an in-place re-targeted instance once its NodeClaim is labeled with the reservation", func() {
+			migrationCtx := options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacityMigration: lo.ToPtr(true)}}))
+			out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
+			out.Reservations[0].Instances[0].SpotInstanceRequestId = nil
+			out.Reservations[0].Instances[0].CapacityReservationId = lo.ToPtr("cr-bar")
+			out.Reservations[0].Instances[0].CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+				CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr("cr-bar")},
+			}
+			awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(out)
+			awsEnv.InstanceCache.Flush()
+			isDrifted, err := cloudProvider.IsDrifted(migrationCtx, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isDrifted).To(Equal(corecloudprovider.DriftReason("")))
+
+			nodeClaim.Labels[corecloudprovider.ReservationIDLabel] = "cr-bar"
+			awsEnv.InstanceCache.Flush()
+			isDrifted, err = cloudProvider.IsDrifted(migrationCtx, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isDrifted).To(Equal(cloudprovider.CapacityReservationDrift))
+		})
 		It("should not drift when capacity reservation falls back to on-demand", func() {
 			// Reflect capacity reservation and in the instance
 			nodeClass.Status.CapacityReservations = []v1.CapacityReservation{

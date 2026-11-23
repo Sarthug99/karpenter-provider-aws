@@ -734,6 +734,37 @@ func (c *Client) DescribeInstances(_ context.Context, input *ec2.DescribeInstanc
 	}, nil
 }
 
+// ModifyInstanceCapacityReservationAttributes is overridden so kwok never calls real EC2; coverage is immediate.
+func (c *Client) ModifyInstanceCapacityReservationAttributes(_ context.Context, input *ec2.ModifyInstanceCapacityReservationAttributesInput, _ ...func(*ec2.Options)) (*ec2.ModifyInstanceCapacityReservationAttributesOutput, error) {
+	<-c.readBackupCompleted
+	if lo.FromPtr(input.DryRun) {
+		return nil, &smithy.GenericAPIError{
+			Code:    errors.DryRunOperationErrorCode,
+			Message: "Request would have succeeded, but DryRun flag is set",
+		}
+	}
+	id := lo.FromPtr(input.InstanceId)
+	raw, ok := c.instances.Load(id)
+	if !ok {
+		return nil, &smithy.GenericAPIError{
+			Code:    "InvalidInstanceID.NotFound",
+			Message: fmt.Sprintf("The instance IDs '%s' do not exist", id),
+		}
+	}
+	instance := raw.(ec2types.Instance)
+	spec := input.CapacityReservationSpecification
+	if spec == nil || spec.CapacityReservationTarget == nil || spec.CapacityReservationTarget.CapacityReservationId == nil {
+		return nil, &smithy.GenericAPIError{Code: "InvalidParameterCombination", Message: "a capacity reservation target is required"}
+	}
+	instance.CapacityReservationId = spec.CapacityReservationTarget.CapacityReservationId
+	instance.CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+		CapacityReservationPreference: spec.CapacityReservationPreference,
+		CapacityReservationTarget:     &ec2types.CapacityReservationTargetResponse{CapacityReservationId: spec.CapacityReservationTarget.CapacityReservationId},
+	}
+	c.instances.Store(id, instance)
+	return &ec2.ModifyInstanceCapacityReservationAttributesOutput{Return: lo.ToPtr(true)}, nil
+}
+
 func (c *Client) RunInstances(_ context.Context, input *ec2.RunInstancesInput, _ ...func(*ec2.Options)) (*ec2.RunInstancesOutput, error) {
 	<-c.readBackupCompleted
 	if !c.rateLimiterProvider.RunInstances().TryAccept() {
