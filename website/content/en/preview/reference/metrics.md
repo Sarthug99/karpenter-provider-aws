@@ -1108,6 +1108,7 @@ Number of on-demand or orphaned nodes not migrated in the last pass, by reason.
     - `nodepool_incompatible` — The NodePool requirements don't allow the reserved labels.
     - `no_capacity` — Every compatible capacity reservation is full.
     - `no_compatible_cr` — No capacity reservation selected by the EC2NodeClass matches the instance.
+    - `zonal_shift` — The instance's availability zone is zonally shifted away from.
 
 ### `karpenter_capacity_reservation_migration_coverage_duration_seconds`
 Time from re-targeting a node at a capacity reservation to EC2 reporting it covered.

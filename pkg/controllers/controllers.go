@@ -130,7 +130,7 @@ func NewControllers(
 		controllers = append(controllers, instancestatuscontroller.NewController(kubeClient, clk, cloudProvider, instanceStatusProvider))
 	}
 	if crmigration.Enabled(ctx) {
-		controllers = append(controllers, crmigration.NewController(clk, kubeClient, cloudProvider, instanceProvider, capacityReservationProvider, recorder))
+		controllers = append(controllers, crmigration.NewController(clk, kubeClient, cloudProvider, instanceProvider, capacityReservationProvider, zonalshiftProvider, recorder))
 	} else if options.FromContext(ctx).FeatureGates.ReservedCapacityMigration {
 		log.FromContext(ctx).Info("ReservedCapacityMigration requires the ReservedCapacity feature gate, not starting the capacity reservation migration controller")
 	}

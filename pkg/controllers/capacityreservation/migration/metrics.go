@@ -38,6 +38,7 @@ const (
 	reasonNodePoolIncompatible = "nodepool_incompatible"
 	reasonNoCapacity           = "no_capacity"
 	reasonNoCompatibleCR       = "no_compatible_cr"
+	reasonZonalShift           = "zonal_shift"
 )
 
 var (
@@ -73,6 +74,7 @@ var (
 			{Name: reasonNodePoolIncompatible, Help: "The NodePool requirements don't allow the reserved labels."},
 			{Name: reasonNoCapacity, Help: "Every compatible capacity reservation is full."},
 			{Name: reasonNoCompatibleCR, Help: "No capacity reservation selected by the EC2NodeClass matches the instance."},
+			{Name: reasonZonalShift, Help: "The instance's availability zone is zonally shifted away from."},
 		},
 	}
 

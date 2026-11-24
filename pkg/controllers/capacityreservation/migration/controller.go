@@ -52,6 +52,7 @@ import (
 	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
 	awserrors "github.com/aws/karpenter-provider-aws/pkg/errors"
 	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/arczonalshift"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/capacityreservation"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instance"
 	"github.com/aws/karpenter-provider-aws/pkg/utils"
@@ -86,6 +87,7 @@ type Controller struct {
 	cloudProvider    cloudprovider.CloudProvider
 	instanceProvider instance.Provider
 	crProvider       capacityreservation.Provider
+	zonalShift       arczonalshift.Provider
 	recorder         events.Recorder
 
 	backoff          map[string]backoffEntry
@@ -94,13 +96,14 @@ type Controller struct {
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, instanceProvider instance.Provider,
-	crProvider capacityreservation.Provider, recorder events.Recorder) *Controller {
+	crProvider capacityreservation.Provider, zonalShift arczonalshift.Provider, recorder events.Recorder) *Controller {
 	return &Controller{
 		clk:              clk,
 		kubeClient:       kubeClient,
 		cloudProvider:    cloudProvider,
 		instanceProvider: instanceProvider,
 		crProvider:       crProvider,
+		zonalShift:       zonalShift,
 		recorder:         recorder,
 		backoff:          map[string]backoffEntry{},
 		cases:            map[string]string{},
@@ -429,6 +432,11 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	if inst.State != ec2types.InstanceStateNameRunning || inst.CapacityType != karpv1.CapacityTypeOnDemand ||
 		state.Lifecycle == ec2types.InstanceLifecycleTypeCapacityBlock || state.Lifecycle == ec2types.InstanceLifecycleTypeInterruptibleCapacityReservation ||
 		state.Lifecycle == ec2types.InstanceLifecycleTypeSpot || state.CoveringID != "" {
+		return nil, nil
+	}
+	// Modify is refused in a shifted zone, so don't annotate and fail every pass.
+	if inst.ZoneID != "" && c.zonalShift.IsZonalShifted(ctx, inst.ZoneID) {
+		p.ineligible[reasonZonalShift]++
 		return nil, nil
 	}
 	var migrationCase string
@@ -760,7 +768,7 @@ func (c *Controller) publishGauges(p *pass) {
 		MigrationPending.Set(float64(instances.Len()), map[string]string{reservationIDLabel.Name: id})
 	}
 	MigrationIneligible.Reset()
-	for _, reason := range []string{reasonPreferenceOpen, reasonPodIncompatible, reasonNodePoolIncompatible, reasonNoCapacity, reasonNoCompatibleCR} {
+	for _, reason := range []string{reasonPreferenceOpen, reasonPodIncompatible, reasonNodePoolIncompatible, reasonNoCapacity, reasonNoCompatibleCR, reasonZonalShift} {
 		MigrationIneligible.Set(float64(p.ineligible[reason]), map[string]string{reasonLabel.Name: reason})
 	}
 	MigrationStalled.Set(float64(p.stalled), map[string]string{})

@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/arczonalshift"
+	arczonalshifttypes "github.com/aws/aws-sdk-go-v2/service/arczonalshift/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/smithy-go"
@@ -255,7 +257,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 		recorder.Reset()
 		migration.MigrationAttemptsTotal.Reset()
 		migration.MigrationIneligible.Reset()
-		controller = migration.NewController(awsEnv.Clock, env.Client, cloudProvider, awsEnv.InstanceProvider, awsEnv.CapacityReservationProvider, recorder)
+		controller = migration.NewController(awsEnv.Clock, env.Client, cloudProvider, awsEnv.InstanceProvider, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
 		nodeClass = test.EC2NodeClass()
 		nodePool = coretest.NodePool(karpv1.NodePool{Spec: karpv1.NodePoolSpec{Template: karpv1.NodeClaimTemplate{Spec: karpv1.NodeClaimTemplateSpec{
 			Requirements: []karpv1.NodeSelectorRequirementWithMinValues{{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn,
@@ -363,7 +365,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			awsEnv.CapacityReservationProvider.ResetMigrations()
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(2))
-			restarted := migration.NewController(awsEnv.Clock, env.Client, cloudProvider, awsEnv.InstanceProvider, awsEnv.CapacityReservationProvider, recorder)
+			restarted := migration.NewController(awsEnv.Clock, env.Client, cloudProvider, awsEnv.InstanceProvider, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
 			ExpectSingletonReconciled(ctx, restarted)
 			Expect(modifyCalls()).To(Equal(1))
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
@@ -417,7 +419,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			cr := reservation("cr-1", 2)
 			setReservations([]ec2types.CapacityReservation{cr}, cr)
 			makeNode()
-			c := migration.NewController(awsEnv.Clock, nodeClaimPatchNotFound{env.Client}, cloudProvider, awsEnv.InstanceProvider, awsEnv.CapacityReservationProvider, recorder)
+			c := migration.NewController(awsEnv.Clock, nodeClaimPatchNotFound{env.Client}, cloudProvider, awsEnv.InstanceProvider, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
 			result, err := c.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.RequeueAfter).To(Equal(time.Minute))
@@ -532,6 +534,22 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 				i.CapacityReservationSpecification.CapacityReservationPreference = ec2types.CapacityReservationPreferenceOpen
 			}})
 			expectNoMigration("preference_open")
+		})
+		It("should skip instances in a zonally shifted zone without annotating them", func() {
+			setReservations([]ec2types.CapacityReservation{cr}, cr)
+			awsEnv.ARCZonalShiftAPI.GetManagedResourceBehavior.Output.Set(&arczonalshift.GetManagedResourceOutput{
+				ZonalShifts: []arczonalshifttypes.ZonalShiftInResource{{
+					AwayFrom:      lo.ToPtr("tstz1-1a"),
+					ExpiryTime:    lo.ToPtr(time.Now().Add(time.Hour)),
+					AppliedStatus: arczonalshifttypes.AppliedStatusApplied,
+				}},
+			})
+			Expect(awsEnv.ZonalShiftProvider.UpdateZonalShifts(ctx)).To(Succeed())
+			nc, _, _ := makeNode(nodeOpts{instance: func(i *ec2types.Instance) { i.Placement.AvailabilityZoneId = lo.ToPtr("tstz1-1a") }})
+			expectNoMigration("zonal_shift")
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(ExpectExists(ctx, env.Client, nc).Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationTarget))
+			Expect(recorder.Calls(migration.EventReasonFailed)).To(Equal(0))
 		})
 		It("should skip spot instances", func() {
 			setReservations([]ec2types.CapacityReservation{cr}, cr)
