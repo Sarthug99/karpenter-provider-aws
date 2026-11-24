@@ -25,6 +25,7 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	controllerruntime "sigs.k8s.io/controller-runtime"
@@ -35,17 +36,23 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
+
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/capacityreservation"
+	"github.com/aws/karpenter-provider-aws/pkg/utils"
 )
 
 type Controller struct {
 	cp         cloudprovider.CloudProvider
 	kubeClient client.Client
+	crProvider capacityreservation.Provider
 }
 
-func NewController(kubeClient client.Client, cp cloudprovider.CloudProvider) *Controller {
+func NewController(kubeClient client.Client, cp cloudprovider.CloudProvider, crProvider capacityreservation.Provider) *Controller {
 	return &Controller{
 		cp:         cp,
 		kubeClient: kubeClient,
+		crProvider: crProvider,
 	}
 }
 
@@ -75,10 +82,21 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return nc.Status.ProviderID, nc
 	})
 	updatedNodeClaims := sets.New[string]()
+	nodeClasses := map[string]*v1.EC2NodeClass{}
 	var errs []error
 	for i := range ncs.Items {
 		cpNC, ok := providerIDsToCPNodeClaims[ncs.Items[i].Status.ProviderID]
 		if !ok {
+			continue
+		}
+		if cpNC.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved {
+			updated, err := c.promote(ctx, nodeClasses, cpNC, &ncs.Items[i])
+			if err != nil {
+				errs = append(errs, err)
+			}
+			if updated {
+				updatedNodeClaims.Insert(ncs.Items[i].Name)
+			}
 			continue
 		}
 		updated, err := c.syncCapacityType(ctx, cpNC.Labels[karpv1.CapacityTypeLabelKey], &ncs.Items[i])
@@ -103,6 +121,59 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	return reconciler.Result{RequeueAfter: time.Minute}, nil
 }
 
+// promote relabels an on-demand NodeClaim reserved once EC2 covers its instance with a reservation its EC2NodeClass
+// selects, e.g. after an in-place migration that finished while the migration controller was off. Unselected
+// reservations are left on-demand, as with open ODCRs, so they don't induce capacity reservation drift.
+//
+//nolint:gocyclo
+func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2NodeClass, cpNC, nc *karpv1.NodeClaim) (bool, error) {
+	if !nc.DeletionTimestamp.IsZero() || nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand || nc.Spec.NodeClassRef == nil {
+		return false, nil
+	}
+	id := cpNC.Labels[cloudprovider.ReservationIDLabel]
+	nodeClass, ok := nodeClasses[nc.Spec.NodeClassRef.Name]
+	if !ok {
+		nodeClass = &v1.EC2NodeClass{}
+		if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nc.Spec.NodeClassRef.Name}, nodeClass); err != nil {
+			if !errors.IsNotFound(err) {
+				return false, serrors.Wrap(fmt.Errorf("getting ec2nodeclass, %w", err), "EC2NodeClass", klog.KRef("", nc.Spec.NodeClassRef.Name))
+			}
+			nodeClass = nil
+		}
+		nodeClasses[nc.Spec.NodeClassRef.Name] = nodeClass
+	}
+	if id == "" || nodeClass == nil || !lo.ContainsBy(nodeClass.Status.CapacityReservations, func(cr v1.CapacityReservation) bool { return cr.ID == id }) {
+		return false, nil
+	}
+	labels := lo.PickByKeys(cpNC.Labels, []string{karpv1.CapacityTypeLabelKey, cloudprovider.ReservationIDLabel,
+		v1.LabelCapacityReservationType, v1.LabelCapacityReservationInterruptible})
+	nodes, err := nodeclaimutils.AllNodesForNodeClaim(ctx, c.kubeClient, nc)
+	if err != nil {
+		return false, serrors.Wrap(fmt.Errorf("listing nodes for nodeclaim, %w", err), "NodeClaim", klog.KObj(nc))
+	}
+	// Nodes first, so a failed NodeClaim patch retries both.
+	for _, n := range nodes {
+		if !n.DeletionTimestamp.IsZero() || n.Labels[karpv1.NodeRegisteredLabelKey] != "true" {
+			continue
+		}
+		stored := n.DeepCopy()
+		n.Labels = lo.Assign(n.Labels, labels)
+		if err := c.kubeClient.Patch(ctx, n, client.MergeFrom(stored)); client.IgnoreNotFound(err) != nil {
+			return false, serrors.Wrap(fmt.Errorf("patching node, %w", err), "Node", klog.KObj(n))
+		}
+	}
+	stored := nc.DeepCopy()
+	nc.Labels = lo.Assign(nc.Labels, labels)
+	if err := c.kubeClient.Patch(ctx, nc, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+		return false, client.IgnoreNotFound(serrors.Wrap(fmt.Errorf("patching nodeclaim, %w", err), "NodeClaim", klog.KObj(nc)))
+	}
+	// EC2's count now includes this instance, but our cache won't until its next sync.
+	if instanceID, err := utils.ParseInstanceID(nc.Status.ProviderID); err == nil {
+		c.crProvider.MarkMigrated(id, instanceID)
+	}
+	return true, nil
+}
+
 // syncCapacityType will update the capacity type for the given NodeClaim. This accounts for the fact that capacity
 // reservations will expire, demoting NodeClaims with capacity type "reserved" to "on-demand".
 //
@@ -113,8 +184,6 @@ func (c *Controller) syncCapacityType(ctx context.Context, capacityType string, 
 		return false, nil
 	}
 
-	// For now we only account for the case where a reserved NodeClaim becomes an on-demand NodeClaim. This does not
-	// account for on-demand NodeClaims being promoted to reserved since that is not natively supported by Karpenter.
 	if capacityType != karpv1.CapacityTypeOnDemand {
 		return false, nil
 	}

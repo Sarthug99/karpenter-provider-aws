@@ -59,8 +59,8 @@ import (
 )
 
 const (
-	maxModifyCallsPerPass   = 10
-	stallThreshold          = 30 * time.Minute
+	maxModifyCallsPerPass = 10
+	stallThreshold        = 30 * time.Minute
 	// Coverage can take up to stallThreshold, so a reservation ending sooner than this would barely hold the node.
 	minReservationRemaining = time.Hour
 	initialBackoff          = 5 * time.Minute
@@ -92,9 +92,9 @@ type Controller struct {
 	zonalShift       arczonalshift.Provider
 	recorder         events.Recorder
 
-	backoff          map[string]backoffEntry
-	cases            map[string]string // instance ID -> migration case, for metrics only
-	unauthorized     backoffEntry      // a missing permission is role-wide, so it backs off every instance
+	backoff      map[string]backoffEntry
+	cases        map[string]string // instance ID -> migration case, for metrics only
+	unauthorized backoffEntry      // a missing permission is role-wide, so it backs off every instance
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, instanceProvider instance.Provider,
@@ -352,23 +352,23 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	if err != nil {
 		return err
 	}
-	reason := ""
 	if nodeClass == nil || !adoptable(nodeClass, target) {
-		reason = "the reservation is no longer selected by the EC2NodeClass"
-	} else if ids, why, err := c.filterCompatible(ctx, p, nc, nodes, []string{target}); err != nil {
-		return err
-	} else if len(ids) == 0 {
-		reason = lo.Ternary(why == "", "the NodePool is gone", strings.ReplaceAll(why, "_", " "))
-	}
-	if reason != "" {
-		// The move can't be undone, so leave the labels on-demand; adoption relabels it once it is compatible.
+		// Like an open ODCR match, an unselected reservation stays on-demand; adoption relabels it if it is selected again.
 		if err := c.clearTarget(ctx, nc); err != nil {
 			return err
 		}
 		c.crProvider.MarkMigrated(target, inst.ID)
 		delete(c.cases, inst.ID)
-		c.recorder.Publish(notRelabeledEvent(nc, target, reason))
+		c.recorder.Publish(notRelabeledEvent(nc, target, "the reservation is no longer selected by the EC2NodeClass"))
 		return nil
+	}
+	// The move can't be undone, so the labels follow EC2 even if the NodePool or a pod now rejects them.
+	ids, why, err := c.filterCompatible(ctx, p, nc, nodes, []string{target})
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		c.recorder.Publish(incompatibleEvent(nc, target, lo.Ternary(why == "", "the NodePool is gone", strings.ReplaceAll(why, "_", " "))))
 	}
 	labels := reservedLabels(target)
 	for _, node := range nodes {

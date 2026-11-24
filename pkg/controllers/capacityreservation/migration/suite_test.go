@@ -88,7 +88,7 @@ var _ = BeforeSuite(func() {
 	cloudProvider = cloudprovider.New(awsEnv.InstanceTypesProvider, awsEnv.InstanceProvider, events.NewRecorder(&record.FakeRecorder{}),
 		env.Client, awsEnv.AMIProvider, awsEnv.SecurityGroupProvider, awsEnv.CapacityReservationProvider, awsEnv.PlacementGroupProvider, awsEnv.InstanceTypeStore, lo.ToPtr(""))
 	recorder = coretest.NewEventRecorder()
-	capacityTypeController = capacitytype.NewController(env.Client, cloudProvider)
+	capacityTypeController = capacitytype.NewController(env.Client, cloudProvider, awsEnv.CapacityReservationProvider)
 })
 
 var _ = AfterSuite(func() {
@@ -545,7 +545,9 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(targets).To(ConsistOf("cr-c", "cr-b", "cr-b"))
 		})
 		It("should skip reservations ending within the hour", func() {
-			ending := reservation("cr-1", 5, func(cr *ec2types.CapacityReservation) { cr.EndDate = lo.ToPtr(awsEnv.Clock.Now().Add(30 * time.Minute)) })
+			ending := reservation("cr-1", 5, func(cr *ec2types.CapacityReservation) {
+				cr.EndDate = lo.ToPtr(awsEnv.Clock.Now().Add(30 * time.Minute))
+			})
 			setReservations([]ec2types.CapacityReservation{ending}, ending)
 			makeNode()
 			ExpectSingletonReconciled(ctx, controller)
@@ -996,28 +998,51 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			expectReserved(nc, node, "cr-1")
 			Expect(modifyCalls()).To(Equal(1))
 		})
-		It("should not relabel when the NodePool stopped allowing reserved while pending", func() {
+		It("should still relabel, with a warning, when the NodePool stopped allowing reserved while pending", func() {
 			nc, node, id := makeNode()
 			ExpectSingletonReconciled(ctx, controller)
 			nodePool.Spec.Template.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeOnDemand}}}
 			ExpectApplied(ctx, env.Client, nodePool)
 			cover(id)
 			ExpectSingletonReconciled(ctx, controller)
-			expectOnDemand(nc, node)
-			Expect(recorder.Calls(migration.EventReasonNotRelabeled)).To(Equal(1))
+			expectReserved(nc, node, "cr-1")
+			Expect(ExpectExists(ctx, env.Client, nc).Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationTarget))
+			Expect(recorder.Calls(migration.EventReasonIncompatible)).To(Equal(1))
+			Expect(recorder.Calls(migration.EventReasonCompleted)).To(Equal(1))
+			// Delete returns the slot to the reservation EC2 actually used.
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
 		})
-		It("should not relabel when a pod requiring on-demand landed while pending", func() {
+		It("should still relabel, with a warning, when a pod requiring on-demand landed while pending", func() {
 			nc, node, id := makeNode()
 			ExpectSingletonReconciled(ctx, controller)
 			pod := coretest.Pod(coretest.PodOptions{NodeName: node.Name, NodeSelector: map[string]string{karpv1.CapacityTypeLabelKey: karpv1.CapacityTypeOnDemand}})
 			ExpectApplied(ctx, env.Client, pod)
 			cover(id)
 			ExpectSingletonReconciled(ctx, controller)
-			expectOnDemand(nc, node)
-
-			ExpectDeleted(ctx, env.Client, pod)
-			ExpectSingletonReconciled(ctx, controller)
 			expectReserved(nc, node, "cr-1")
+			Expect(recorder.Calls(migration.EventReasonIncompatible)).To(Equal(1))
+		})
+		It("should converge labels when the migration gate is turned off while a migration is pending", func() {
+			nc, node, id := makeNode()
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(1))
+			// A restart with the gate off drops the in-memory ledger and stops the migration controller.
+			awsEnv.CapacityReservationProvider.SetPendingMigrations(nil)
+			gateOff := options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacityMigration: lo.ToPtr(false)}}))
+			cover(id)
+			ExpectSingletonReconciled(gateOff, capacityTypeController)
+			expectReserved(nc, node, "cr-1")
+			// The slot stays held until EC2's next sync counts the instance.
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
+		})
+		It("should not promote coverage by a reservation the EC2NodeClass doesn't select", func() {
+			nc, node, id := makeNode()
+			ExpectSingletonReconciled(ctx, controller)
+			other := reservation("cr-2", 2)
+			setReservations([]ec2types.CapacityReservation{cr, other}, other)
+			cover(id)
+			ExpectSingletonReconciled(ctx, capacityTypeController)
+			expectOnDemand(nc, node)
 		})
 		It("should relabel every Node for a NodeClaim with duplicate Nodes", func() {
 			nc, node, id := makeNode()
@@ -1036,7 +1061,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 				flipped := stored.DeepCopy()
 				flipped.Labels = lo.Assign(flipped.Labels, map[string]string{karpv1.CapacityTypeLabelKey: karpv1.CapacityTypeReserved, corecloudprovider.ReservationIDLabel: "cr-1"})
 				Expect(env.Client.Patch(ctx, flipped, client.MergeFrom(stored))).To(Succeed())
-			}})
+			}}, awsEnv.CapacityReservationProvider)
 			ExpectSingletonReconciled(ctx, ct)
 			Expect(ExpectExists(ctx, env.Client, nc).Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
 			_ = node

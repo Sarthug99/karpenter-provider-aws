@@ -29,6 +29,7 @@ const (
 	EventReasonFailed       = "CapacityReservationMigrationFailed"
 	EventReasonStalled      = "CapacityReservationMigrationStalled"
 	EventReasonNotRelabeled = "CapacityReservationMigrationNotRelabeled"
+	EventReasonIncompatible = "CapacityReservationMigrationIncompatible"
 )
 
 func startedEvent(nc *karpv1.NodeClaim, reservationID string) events.Event {
@@ -78,6 +79,16 @@ func notRelabeledEvent(nc *karpv1.NodeClaim, reservationID, reason string) event
 		Type:           corev1.EventTypeWarning,
 		Reason:         EventReasonNotRelabeled,
 		Message:        fmt.Sprintf("Instance is covered by capacity reservation %s but left labeled on-demand: %s", reservationID, reason),
+		DedupeValues:   []string{string(nc.UID), reservationID},
+	}
+}
+
+func incompatibleEvent(nc *karpv1.NodeClaim, reservationID, reason string) events.Event {
+	return events.Event{
+		InvolvedObject: nc,
+		Type:           corev1.EventTypeWarning,
+		Reason:         EventReasonIncompatible,
+		Message:        fmt.Sprintf("Instance is covered by capacity reservation %s and relabeled reserved, but %s; the node may drift or lose pods", reservationID, reason),
 		DedupeValues:   []string{string(nc.UID), reservationID},
 	}
 }
