@@ -186,6 +186,17 @@ func (n notAttemptedOnce) ModifyCapacityReservationTarget(ctx context.Context, i
 	return n.Provider.ModifyCapacityReservationTarget(ctx, id, target)
 }
 
+// throttledBeforeModify is throttled on the DescribeInstances that precedes every Modify.
+type throttledBeforeModify struct {
+	instance.Provider
+	calls *int
+}
+
+func (t throttledBeforeModify) ModifyCapacityReservationTarget(context.Context, string, string) error {
+	*t.calls++
+	return fmt.Errorf("%w, %w", instance.ErrModifyNotAttempted, &smithy.GenericAPIError{Code: "RequestLimitExceeded", Fault: smithy.FaultClient})
+}
+
 // listThenRun runs a hook right after taking the instance snapshot, to interleave a concurrent writer.
 type listThenRun struct {
 	*cloudprovider.CloudProvider
@@ -1531,6 +1542,43 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 				_, ok := nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget]
 				return ok
 			})).To(Equal(1))
+		})
+		It("should end the pass when a Modify was never attempted because of throttling", func() {
+			makeNode()
+			makeNode()
+			calls := 0
+			c := migration.NewController(awsEnv.Clock, env.Client, cloudProvider, throttledBeforeModify{awsEnv.InstanceProvider, &calls}, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
+			ExpectSingletonReconciled(ctx, c)
+			Expect(calls).To(Equal(1))
+			ncs := &karpv1.NodeClaimList{}
+			Expect(env.Client.List(ctx, ncs)).To(Succeed())
+			Expect(lo.CountBy(ncs.Items, func(nc karpv1.NodeClaim) bool {
+				_, ok := nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget]
+				return ok
+			})).To(Equal(0))
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(2))
+		})
+		It("should forget an instance's unauthorized backoff once it has been idle past the cap", func() {
+			_, node, _ := makeNode()
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "UnauthorizedOperation", Fault: smithy.FaultClient}, fake.MaxCalls(2))
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(1))
+			// The node is ineligible for over an hour after its 5m backoff ends.
+			node = ExpectExists(ctx, env.Client, node)
+			node.Spec.Taints = append(node.Spec.Taints, karpv1.DisruptedNoScheduleTaint)
+			ExpectApplied(ctx, env.Client, node)
+			awsEnv.Clock.Step(66 * time.Minute)
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(1))
+			node.Spec.Taints = nil
+			ExpectApplied(ctx, env.Client, node)
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(2))
+			// The second denial starts over at 5m instead of doubling to 10m.
+			awsEnv.Clock.Step(6 * time.Minute)
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(1))
 		})
 		It("should skip a node whose instance is gone", func() {
 			nc, _, _ := makeNode()
