@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
@@ -372,7 +371,7 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		}
 		c.crProvider.MarkMigrated(target, inst.ID)
 		delete(c.cases, inst.ID)
-		c.recorder.Publish(notRelabeledEvent(nc, target, "the reservation is no longer selected by the EC2NodeClass"))
+		c.recorder.Publish(notRelabeledEvent(nc, target, lo.Ternary(nodeClass == nil, "the EC2NodeClass is gone", "the reservation is no longer selected by the EC2NodeClass")))
 		return nil
 	}
 	// The move can't be undone, so the labels follow EC2 even if the NodePool or a pod now rejects them.
@@ -381,7 +380,7 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		return err
 	}
 	if len(ids) == 0 {
-		c.recorder.Publish(incompatibleEvent(nc, target, lo.Ternary(why == "", "the NodePool is gone", strings.ReplaceAll(why, "_", " "))))
+		c.recorder.Publish(incompatibleEvent(nc, target, incompatibleReasons[why]))
 	}
 	labels := reservedLabels(target)
 	for _, node := range nodes {
@@ -412,6 +411,12 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	c.recorder.Publish(completedEvent(nc, target))
 	log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Info("migrated node into capacity reservation")
 	return nil
+}
+
+var incompatibleReasons = map[string]string{
+	"":                         "its NodePool is gone",
+	reasonNodePoolIncompatible: "its NodePool no longer allows it",
+	reasonPodIncompatible:      "a pod on it requires other labels",
 }
 
 // adoptable reports whether id is a reservation the controller could have chosen, so the labels it writes are accurate.

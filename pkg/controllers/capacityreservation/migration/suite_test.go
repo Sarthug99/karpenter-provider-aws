@@ -1116,6 +1116,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			expectReserved(nc, node, "cr-1")
 			Expect(ExpectExists(ctx, env.Client, nc).Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationTarget))
 			Expect(recorder.Calls(migration.EventReasonIncompatible)).To(Equal(1))
+			Expect(recorder.DetectedEvent("Instance is covered by capacity reservation cr-1 and relabeled reserved, but its NodePool no longer allows it; the node may drift or lose pods")).To(BeTrue())
 			Expect(recorder.Calls(migration.EventReasonCompleted)).To(Equal(1))
 			// Delete returns the slot to the reservation EC2 actually used.
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
@@ -1129,6 +1130,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			expectReserved(nc, node, "cr-1")
 			Expect(recorder.Calls(migration.EventReasonIncompatible)).To(Equal(1))
+			Expect(recorder.DetectedEvent("Instance is covered by capacity reservation cr-1 and relabeled reserved, but a pod on it requires other labels; the node may drift or lose pods")).To(BeTrue())
 		})
 		It("should converge labels when the migration gate is turned off while a migration is pending", func() {
 			nc, node, id := makeNode()
