@@ -494,7 +494,10 @@ func reservedLabels(reservationID string) map[string]string {
 //
 //nolint:gocyclo
 func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim, inst *instance.Instance) (*candidate, error) {
-	if nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand {
+	// capacitytype briefly keeps an orphan's reserved labels so it can be retargeted before requirements drift.
+	heldOrphan := nc.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved && inst.CapacityReservationState.TargetID != "" &&
+		inst.CapacityReservationState.TargetID == nc.Labels[cloudprovider.ReservationIDLabel]
+	if nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand && !heldOrphan {
 		return nil, nil
 	}
 	if !nc.StatusConditions().Get(karpv1.ConditionTypeLaunched).IsTrue() ||

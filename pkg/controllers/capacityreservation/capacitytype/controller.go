@@ -24,10 +24,12 @@ import (
 	"github.com/awslabs/operatorpkg/singleton"
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -43,10 +45,15 @@ import (
 	"github.com/aws/karpenter-provider-aws/pkg/utils"
 )
 
+// orphanHold bounds how long an orphaned node keeps reserved labels while the migration controller retargets it.
+const orphanHold = 3 * time.Minute
+
 type Controller struct {
 	cp         cloudprovider.CloudProvider
 	kubeClient client.Client
 	crProvider capacityreservation.Provider
+	clk        clock.Clock
+	orphanedAt map[string]time.Time // NodeClaim name -> when its reservation was first seen gone
 }
 
 func NewController(kubeClient client.Client, cp cloudprovider.CloudProvider, crProvider capacityreservation.Provider) *Controller {
@@ -54,7 +61,14 @@ func NewController(kubeClient client.Client, cp cloudprovider.CloudProvider, crP
 		cp:         cp,
 		kubeClient: kubeClient,
 		crProvider: crProvider,
+		clk:        clock.RealClock{},
+		orphanedAt: map[string]time.Time{},
 	}
+}
+
+func (c *Controller) WithClock(clk clock.Clock) *Controller {
+	c.clk = clk
+	return c
 }
 
 func (*Controller) Name() string {
@@ -83,6 +97,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return nc.Status.ProviderID, nc
 	})
 	updatedNodeClaims := sets.New[string]()
+	held := sets.New[string]()
 	nodeClasses := map[string]*v1.EC2NodeClass{}
 	var errs []error
 	for i := range ncs.Items {
@@ -94,6 +109,9 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		var err error
 		if cpNC.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved {
 			updated, err = c.promote(ctx, nodeClasses, cpNC, &ncs.Items[i])
+		} else if hold, herr := c.holdOrphan(ctx, nodeClasses, &ncs.Items[i]); herr != nil || hold {
+			err = herr
+			held.Insert(ncs.Items[i].Name)
 		} else {
 			updated, err = c.syncCapacityType(ctx, cpNC.Labels[karpv1.CapacityTypeLabelKey], &ncs.Items[i])
 		}
@@ -102,6 +120,11 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		}
 		if updated {
 			updatedNodeClaims.Insert(ncs.Items[i].Name)
+		}
+	}
+	for name := range c.orphanedAt {
+		if !held.Has(name) {
+			delete(c.orphanedAt, name)
 		}
 	}
 	if len(updatedNodeClaims) != 0 {
@@ -166,6 +189,46 @@ func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2
 	if instanceID, err := utils.ParseInstanceID(nc.Status.ProviderID); err == nil && first {
 		c.crProvider.MarkMigrated(id, instanceID)
 	}
+	return true, nil
+}
+
+// holdOrphan keeps a reserved NodeClaim's labels for up to orphanHold after its reservation ends, while the migration
+// controller can still retarget it, so requirements drift in a reserved-only NodePool doesn't fire first.
+func (c *Controller) holdOrphan(ctx context.Context, nodeClasses map[string]*v1.EC2NodeClass, nc *karpv1.NodeClaim) (bool, error) {
+	if !options.FromContext(ctx).FeatureGates.ReservedCapacityMigration || !nc.DeletionTimestamp.IsZero() ||
+		nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeReserved || nc.Spec.NodeClassRef == nil {
+		return false, nil
+	}
+	first, ok := c.orphanedAt[nc.Name]
+	if !ok {
+		first = c.clk.Now()
+	}
+	if c.clk.Since(first) >= orphanHold {
+		return false, nil
+	}
+	pending := nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget]
+	if pending == "" || pending == nc.Labels[cloudprovider.ReservationIDLabel] {
+		nodeClass, ok := nodeClasses[nc.Spec.NodeClassRef.Name]
+		if !ok {
+			nodeClass = &v1.EC2NodeClass{}
+			if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nc.Spec.NodeClassRef.Name}, nodeClass); err != nil {
+				if !errors.IsNotFound(err) {
+					return false, serrors.Wrap(fmt.Errorf("getting ec2nodeclass, %w", err), "EC2NodeClass", klog.KRef("", nc.Spec.NodeClassRef.Name))
+				}
+				nodeClass = nil
+			}
+			nodeClasses[nc.Spec.NodeClassRef.Name] = nodeClass
+		}
+		if nodeClass == nil || !lo.ContainsBy(nodeClass.Status.CapacityReservations, func(cr v1.CapacityReservation) bool {
+			return cr.ID != nc.Labels[cloudprovider.ReservationIDLabel] && cr.State == v1.CapacityReservationStateActive &&
+				cr.ReservationType == v1.CapacityReservationTypeDefault && !cr.Interruptible &&
+				cr.InstanceType == nc.Labels[corev1.LabelInstanceTypeStable] && cr.AvailabilityZone == nc.Labels[corev1.LabelTopologyZone] &&
+				c.crProvider.GetAvailableInstanceCount(cr.ID) > 0
+		}) {
+			return false, nil
+		}
+	}
+	c.orphanedAt[nc.Name] = first
 	return true, nil
 }
 

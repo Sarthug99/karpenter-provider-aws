@@ -1607,4 +1607,80 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(ExpectExists(ctx, env.Client, nc).Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationTarget))
 		})
 	})
+
+	Context("D5 orphan label hold", func() {
+		var ct *capacitytype.Controller
+		var reservedOnly *karpv1.NodePool
+		BeforeEach(func() {
+			ct = capacitytype.NewController(env.Client, cloudProvider, awsEnv.CapacityReservationProvider).WithClock(awsEnv.Clock)
+			reservedOnly = coretest.NodePool(karpv1.NodePool{Spec: karpv1.NodePoolSpec{Template: karpv1.NodeClaimTemplate{Spec: karpv1.NodeClaimTemplateSpec{
+				Requirements: []karpv1.NodeSelectorRequirementWithMinValues{{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeReserved}}},
+			}}}})
+			ExpectApplied(ctx, env.Client, reservedOnly)
+		})
+		orphanInReservedOnly := func() (*karpv1.NodeClaim, *corev1.Node, string) {
+			return makeNode(nodeOpts{
+				instance: func(i *ec2types.Instance) {
+					i.Tags[0].Value = lo.ToPtr(reservedOnly.Name)
+					// The reservation ended: the target remains but nothing covers the instance.
+					i.CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+						CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr("cr-dead")},
+					}
+				},
+				nodeClaim: func(nc *karpv1.NodeClaim) {
+					nc.Labels = lo.Assign(nc.Labels, map[string]string{
+						karpv1.NodePoolLabelKey:                  reservedOnly.Name,
+						karpv1.CapacityTypeLabelKey:              karpv1.CapacityTypeReserved,
+						corecloudprovider.ReservationIDLabel:     "cr-dead",
+						v1.LabelCapacityReservationType:          string(v1.CapacityReservationTypeDefault),
+						v1.LabelCapacityReservationInterruptible: "false",
+					})
+				},
+			})
+		}
+		It("should keep an orphan reserved while it is retargeted, so it never reads on-demand", func() {
+			live := reservation("cr-live", 1)
+			setReservations([]ec2types.CapacityReservation{live}, live)
+			// The EC2NodeClass status controller seeds this count in a running cluster.
+			awsEnv.CapacityReservationProvider.SetAvailableInstanceCount("cr-live", 1)
+			nc, node, id := orphanInReservedOnly()
+
+			ExpectSingletonReconciled(ctx, ct)
+			expectReserved(nc, node, "cr-dead")
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(1))
+			Expect(*ec2Instance(id).CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationId).To(Equal("cr-live"))
+
+			// The pending target keeps the hold even though it took the last free slot from the count.
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-live")).To(Equal(0))
+			awsEnv.Clock.Step(time.Minute)
+			ExpectSingletonReconciled(ctx, ct)
+			expectReserved(nc, node, "cr-dead")
+
+			cover(id)
+			ExpectSingletonReconciled(ctx, controller)
+			expectReserved(nc, node, "cr-live")
+			ExpectSingletonReconciled(ctx, ct)
+			expectReserved(nc, node, "cr-live")
+		})
+		It("should demote once the hold window passes without coverage", func() {
+			live := reservation("cr-live", 2)
+			setReservations([]ec2types.CapacityReservation{live}, live)
+			// The EC2NodeClass status controller seeds this count in a running cluster.
+			awsEnv.CapacityReservationProvider.SetAvailableInstanceCount("cr-live", 2)
+			nc, node, _ := orphanInReservedOnly()
+			ExpectSingletonReconciled(ctx, ct)
+			expectReserved(nc, node, "cr-dead")
+			awsEnv.Clock.Step(3 * time.Minute)
+			ExpectSingletonReconciled(ctx, ct)
+			expectOnDemand(nc, node)
+		})
+		It("should demote at once when no selected reservation has a free compatible slot", func() {
+			full := reservation("cr-full", 0)
+			setReservations([]ec2types.CapacityReservation{full}, full)
+			nc, node, _ := orphanInReservedOnly()
+			ExpectSingletonReconciled(ctx, ct)
+			expectOnDemand(nc, node)
+		})
+	})
 })
