@@ -62,7 +62,6 @@ const (
 	stallThreshold          = 30 * time.Minute
 	initialBackoff          = 5 * time.Minute
 	maxBackoff              = time.Hour
-	unauthorizedLogInterval = 10 * time.Minute
 	// DescribeInstances can lag a Modify, so a missing target isn't trusted until this long after the call.
 	modifyVisibilityGrace = 5 * time.Minute
 )
@@ -91,7 +90,7 @@ type Controller struct {
 
 	backoff          map[string]backoffEntry
 	cases            map[string]string // instance ID -> migration case, for metrics only
-	unauthorizedLogs time.Time
+	unauthorized     backoffEntry      // a missing permission is role-wide, so it backs off every instance
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, instanceProvider instance.Provider,
@@ -556,6 +555,9 @@ func (c *Controller) compatibleReservations(ctx context.Context, p *pass, nodeCl
 //nolint:gocyclo
 func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candidate) []error {
 	var errs []error
+	if c.clk.Now().Before(c.unauthorized.next) {
+		return nil
+	}
 	calls := 0
 	for _, cand := range candidates {
 		if calls >= maxModifyCallsPerPass {
@@ -587,6 +589,7 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			p.hold(target, inst.ID)
 			c.crProvider.SetPendingMigrations(p.pending)
 			delete(c.backoff, inst.ID)
+			c.unauthorized = backoffEntry{}
 			c.cases[inst.ID] = cand.caseLabel
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultSuccess, caseLabel.Name: cand.caseLabel})
 			c.recorder.Publish(startedEvent(nc, target))
@@ -611,10 +614,8 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			continue
 		case awserrors.IsUnauthorizedOperationError(err):
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultUnauthorized, caseLabel.Name: cand.caseLabel})
-			if c.clk.Since(c.unauthorizedLogs) > unauthorizedLogInterval {
-				c.unauthorizedLogs = c.clk.Now()
-				log.FromContext(ctx).Error(err, "missing permission ec2:ModifyInstanceCapacityReservationAttributes, skipping capacity reservation migration")
-			}
+			c.unauthorized = c.nextBackoff(c.unauthorized)
+			log.FromContext(ctx).WithValues("retry-after", c.unauthorized.delay).Error(err, "missing permission ec2:ModifyInstanceCapacityReservationAttributes, skipping capacity reservation migration")
 			return errs
 		case awserrors.IsRateLimitedError(err):
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultThrottled, caseLabel.Name: cand.caseLabel})
@@ -660,11 +661,12 @@ func (p *pass) hold(target, instanceID string) {
 }
 
 func (c *Controller) backOff(instanceID string) {
-	delay := initialBackoff
-	if b, ok := c.backoff[instanceID]; ok {
-		delay = min(b.delay*2, maxBackoff)
-	}
-	c.backoff[instanceID] = backoffEntry{next: c.clk.Now().Add(delay), delay: delay}
+	c.backoff[instanceID] = c.nextBackoff(c.backoff[instanceID])
+}
+
+func (c *Controller) nextBackoff(b backoffEntry) backoffEntry {
+	delay := lo.Ternary(b.delay == 0, initialBackoff, min(b.delay*2, maxBackoff))
+	return backoffEntry{next: c.clk.Now().Add(delay), delay: delay}
 }
 
 func (c *Controller) prune(instances map[string]*instance.Instance) {

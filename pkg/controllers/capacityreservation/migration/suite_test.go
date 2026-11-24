@@ -1042,21 +1042,37 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(recorder.Calls(migration.EventReasonFailed)).To(Equal(1))
 			ExpectExists(ctx, env.Client, nc)
 		})
-		DescribeTable("should end the pass early",
-			func(code string) {
-				makeNode()
-				makeNode()
-				awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: code, Fault: smithy.FaultClient}, fake.MaxCalls(1))
-				ExpectSingletonReconciled(ctx, controller)
-				Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.FailedCalls()).To(Equal(1))
-				Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(0))
-				// Neither is backed off, so the next pass migrates both.
-				ExpectSingletonReconciled(ctx, controller)
-				Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(2))
-			},
-			Entry("unauthorized", "UnauthorizedOperation"),
-			Entry("throttled", "RequestLimitExceeded"),
-		)
+		It("should end the pass early on throttling without backing off", func() {
+			makeNode()
+			makeNode()
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "RequestLimitExceeded", Fault: smithy.FaultClient}, fake.MaxCalls(1))
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.FailedCalls()).To(Equal(1))
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(0))
+			// Neither is backed off, so the next pass migrates both.
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(2))
+		})
+		It("should back off every instance, exponentially, while unauthorized", func() {
+			makeNode()
+			makeNode()
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "UnauthorizedOperation", Fault: smithy.FaultClient}, fake.MaxCalls(2))
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(1))
+			ExpectMetricCounterValue(migration.MigrationAttemptsTotal, 1, map[string]string{"result": "unauthorized", "case": "on_demand"})
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(1))
+			awsEnv.Clock.Step(6 * time.Minute)
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(2))
+			// The second failure doubles the delay to 10 minutes.
+			awsEnv.Clock.Step(6 * time.Minute)
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(2))
+			awsEnv.Clock.Step(5 * time.Minute)
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(2))
+		})
 		It("should skip a node whose instance is gone", func() {
 			nc, _, _ := makeNode()
 			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "InvalidInstanceID.NotFound", Fault: smithy.FaultClient}, fake.MaxCalls(1))
