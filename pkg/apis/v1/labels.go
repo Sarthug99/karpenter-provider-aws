@@ -263,7 +263,7 @@ var (
 	}
 	CapacityReservationMigrationRequestedAtAnnotation = wellknown.Annotation{
 		Name:    AnnotationCapacityReservationMigrationRequestedAt,
-		Example: "2026-11-20T10:00:00Z",
+		Example: "2024-01-01T00:00:00Z",
 		UsedOn:  []runtime.Object{&karpv1.NodeClaim{}},
 		Help: "With the ReservedCapacityMigration feature gate, Karpenter sets this to the RFC3339 time it " +
 			"re-targeted the NodeClaim's instance at a capacity reservation, to measure coverage lag.",

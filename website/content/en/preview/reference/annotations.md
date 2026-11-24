@@ -77,7 +77,7 @@ Values:
 
 Type: Annotation
 
-Example: `karpenter.k8s.aws/capacity-reservation-migration-requested-at: "2026-11-20T10:00:00Z"`
+Example: `karpenter.k8s.aws/capacity-reservation-migration-requested-at: "2024-01-01T00:00:00Z"`
 
 Used on: NodeClaim
 
