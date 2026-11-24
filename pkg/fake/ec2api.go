@@ -78,7 +78,7 @@ type EC2Behavior struct {
 	// ModifyInstanceCapacityReservationCoverage makes the fake Modify also set CapacityReservationId (no coverage lag).
 	ModifyInstanceCapacityReservationCoverage stdatomic.Bool
 	// ModifyInstanceCapacityReservationRetryMaxAttempts is the RetryMaxAttempts the last Modify call's options set.
-	ModifyInstanceCapacityReservationRetryMaxAttempts stdatomic.Int32
+	ModifyInstanceCapacityReservationRetryMaxAttempts stdatomic.Int64
 
 	Subnets                               sync.Map
 	LaunchTemplates                       sync.Map
@@ -295,7 +295,7 @@ func (e *EC2API) ModifyInstanceCapacityReservationAttributes(_ context.Context, 
 	for _, fn := range optFns {
 		fn(&opts)
 	}
-	e.ModifyInstanceCapacityReservationRetryMaxAttempts.Store(int32(opts.RetryMaxAttempts))
+	e.ModifyInstanceCapacityReservationRetryMaxAttempts.Store(int64(opts.RetryMaxAttempts))
 	return e.ModifyInstanceCapacityReservationAttributesBehavior.Invoke(input, func(input *ec2.ModifyInstanceCapacityReservationAttributesInput) (*ec2.ModifyInstanceCapacityReservationAttributesOutput, error) {
 		raw, ok := e.Instances.Load(lo.FromPtr(input.InstanceId))
 		if !ok {

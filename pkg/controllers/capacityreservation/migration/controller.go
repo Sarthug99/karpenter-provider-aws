@@ -339,16 +339,18 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 		// The target died while pending; this is now the orphaned case.
 		return true, c.clearTarget(ctx, nc)
 	}
-	requestedAt, err := time.Parse(time.RFC3339, nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt])
-	if err != nil {
+	raw, ok := nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]
+	if !ok {
 		// Only a completed migration's marker lacks requested-at, and its slot is already in EC2's count.
 		return false, nil
 	}
-	if pendingFor := c.clk.Since(requestedAt); pendingFor > stallThreshold {
-		// EC2 covers a re-target as soon as a slot is free, so a hold this old only keeps a slot from launches.
-		p.stalled++
-		c.recorder.Publish(stalledEvent(nc, target, pendingFor))
-		return false, nil
+	if requestedAt, err := time.Parse(time.RFC3339, raw); err == nil {
+		if pendingFor := c.clk.Since(requestedAt); pendingFor > stallThreshold {
+			// EC2 covers a re-target as soon as a slot is free, so a hold this old only keeps a slot from launches.
+			p.stalled++
+			c.recorder.Publish(stalledEvent(nc, target, pendingFor))
+			return false, nil
+		}
 	}
 	p.hold(target, inst.ID)
 	return false, nil
@@ -860,6 +862,10 @@ func (c *Controller) prune(instances map[string]*instance.Instance) {
 			c.covered.Delete(s)
 		}
 	}
+	c.pruneDenials(instances)
+}
+
+func (c *Controller) pruneDenials(instances map[string]*instance.Instance) {
 	for s, b := range c.denied {
 		if _, ok := instances[s.instanceID]; !ok || c.clk.Since(b.next) > maxBackoff {
 			delete(c.denied, s)
