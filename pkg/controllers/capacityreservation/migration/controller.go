@@ -693,8 +693,7 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultThrottled, caseLabel.Name: cand.caseLabel})
 			return calls, errs
 		default:
-			_, isAPIErr := lo.ErrorsAs[smithy.APIError](err)
-			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: lo.Ternary(isAPIErr, resultClientError, resultError), caseLabel.Name: cand.caseLabel})
+			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultClientError, caseLabel.Name: cand.caseLabel})
 			c.backOff(inst.ID)
 			c.recorder.Publish(failedEvent(nc, target, err))
 			log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Error(err, "failed re-targeting instance at capacity reservation")
