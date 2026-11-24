@@ -188,10 +188,7 @@ func (c *Controller) syncCapacityType(ctx context.Context, capacityType string, 
 	updated := false
 	if nc.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved {
 		stored := nc.DeepCopy()
-		nc.Labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeOnDemand
-		for label := range cloudprovider.ReservedCapacityLabels {
-			delete(nc.Labels, label)
-		}
+		demote(nc.Labels)
 		if err := c.kubeClient.Patch(ctx, nc, client.MergeFrom(stored)); client.IgnoreNotFound(err) != nil {
 			return false, serrors.Wrap(fmt.Errorf("patching nodeclaim, %w", err), "NodeClaim", klog.KObj(nc))
 		}
@@ -218,14 +215,20 @@ func (c *Controller) syncCapacityType(ctx context.Context, capacityType string, 
 			continue
 		}
 		stored := n.DeepCopy()
-		n.Labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeOnDemand
-		for label := range cloudprovider.ReservedCapacityLabels {
-			delete(n.Labels, label)
-		}
+		demote(n.Labels)
 		if err := c.kubeClient.Patch(ctx, n, client.MergeFrom(stored)); client.IgnoreNotFound(err) != nil {
 			return false, serrors.Wrap(fmt.Errorf("patching node, %w", err), "Node", klog.KObj(n))
 		}
 		updated = true
 	}
 	return updated, nil
+}
+
+func demote(labels map[string]string) {
+	labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeOnDemand
+	for label := range cloudprovider.ReservedCapacityLabels {
+		delete(labels, label)
+	}
+	// On-demand offerings require this label to be absent, so leaving it would cause InstanceTypeNotFound drift.
+	delete(labels, v1.LabelCapacityReservationInterruptible)
 }

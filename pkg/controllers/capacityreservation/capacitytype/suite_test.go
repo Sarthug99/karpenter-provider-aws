@@ -109,10 +109,11 @@ var _ = Describe("Capacity Reservation Capacity Type Controller", func() {
 		nodeClaim = coretest.NodeClaim(karpv1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
-					karpv1.CapacityTypeLabelKey:          karpv1.CapacityTypeReserved,
-					corecloudprovider.ReservationIDLabel: reservationID,
-					v1.LabelCapacityReservationType:      string(v1.CapacityReservationTypeDefault),
-					karpv1.NodeRegisteredLabelKey:        "true",
+					karpv1.CapacityTypeLabelKey:              karpv1.CapacityTypeReserved,
+					corecloudprovider.ReservationIDLabel:     reservationID,
+					v1.LabelCapacityReservationType:          string(v1.CapacityReservationTypeDefault),
+					v1.LabelCapacityReservationInterruptible: "false",
+					karpv1.NodeRegisteredLabelKey:            "true",
 				},
 			},
 			Status: karpv1.NodeClaimStatus{
@@ -146,10 +147,12 @@ var _ = Describe("Capacity Reservation Capacity Type Controller", func() {
 		Expect(nodeClaim.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeOnDemand))
 		Expect(nodeClaim.Labels).ToNot(HaveKey(corecloudprovider.ReservationIDLabel))
 		Expect(nodeClaim.Labels).ToNot(HaveKey(v1.LabelCapacityReservationType))
+		Expect(nodeClaim.Labels).ToNot(HaveKey(v1.LabelCapacityReservationInterruptible))
 		node = ExpectExists(ctx, env.Client, node)
 		Expect(node.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeOnDemand))
 		Expect(node.Labels).ToNot(HaveKey(corecloudprovider.ReservationIDLabel))
 		Expect(node.Labels).ToNot(HaveKey(v1.LabelCapacityReservationType))
+		Expect(node.Labels).ToNot(HaveKey(v1.LabelCapacityReservationInterruptible))
 	})
 	It("should demote nodes from reserved to on-demand even if their nodeclaim was demoted previously", func() {
 		out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
@@ -191,6 +194,7 @@ var _ = Describe("Capacity Reservation Capacity Type Controller", func() {
 				labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeOnDemand
 				delete(labels, corecloudprovider.ReservationIDLabel)
 				delete(labels, v1.LabelCapacityReservationType)
+				delete(labels, v1.LabelCapacityReservationInterruptible)
 			}
 			nodeClaim.Annotations = map[string]string{
 				v1.AnnotationCapacityReservationMigrationTarget:      reservationID,
