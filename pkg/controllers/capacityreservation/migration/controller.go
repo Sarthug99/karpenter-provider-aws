@@ -98,6 +98,7 @@ type Controller struct {
 	backoff      map[string]backoffEntry
 	cases        map[string]string       // instance ID -> migration case, for metrics only
 	unauthorized map[string]backoffEntry // reservation ID -> backoff, since a deny may be scoped to one reservation
+	covered      sets.Set[string]        // instance IDs marked migrated without completing
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, instanceProvider instance.Provider,
@@ -113,6 +114,7 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 		backoff:          map[string]backoffEntry{},
 		cases:            map[string]string{},
 		unauthorized:     map[string]backoffEntry{},
+		covered:          sets.New[string](),
 	}
 }
 
@@ -188,7 +190,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		// A draining or briefly unlisted instance keeps its EC2 target, so its slot stays held.
 		if !nc.DeletionTimestamp.IsZero() {
 			if ok {
-				p.hold(target, id)
+				c.holdOrCovered(p, target, inst)
 			}
 			continue
 		}
@@ -200,8 +202,8 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		if err != nil {
 			errs = append(errs, serrors.Wrap(err, "NodeClaim", klog.KObj(nc)))
 			// Stay conservative: an error must not release a slot this instance may hold.
-			p.hold(target, id)
-			p.hold(inst.CapacityReservationState.TargetID, id)
+			c.holdOrCovered(p, target, inst)
+			c.holdOrCovered(p, inst.CapacityReservationState.TargetID, inst)
 			continue
 		}
 		if free {
@@ -723,6 +725,18 @@ func (p *pass) holdLaunch(nc *karpv1.NodeClaim) {
 	}
 }
 
+// holdOrCovered holds the instance's slot in target, unless EC2 already counts it there; then it is held only until the next sync.
+func (c *Controller) holdOrCovered(p *pass, target string, inst *instance.Instance) {
+	if target == "" || inst.CapacityReservationState.CoveringID != target {
+		p.hold(target, inst.ID)
+		return
+	}
+	if !c.covered.Has(inst.ID) {
+		c.crProvider.MarkMigrated(target, inst.ID)
+		c.covered.Insert(inst.ID)
+	}
+}
+
 func (p *pass) hold(target, instanceID string) {
 	if target == "" {
 		return
@@ -751,6 +765,11 @@ func (c *Controller) prune(instances map[string]*instance.Instance) {
 	for id := range c.cases {
 		if _, ok := instances[id]; !ok {
 			delete(c.cases, id)
+		}
+	}
+	for id := range c.covered {
+		if _, ok := instances[id]; !ok {
+			c.covered.Delete(id)
 		}
 	}
 	for id, b := range c.unauthorized {

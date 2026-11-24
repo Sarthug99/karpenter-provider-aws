@@ -427,6 +427,26 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
 		})
+		It("should not hold a draining node's slot past the EC2 sync that counts its coverage", func() {
+			cr := reservation("cr-1", 2)
+			setReservations([]ec2types.CapacityReservation{cr}, cr)
+			nc, _, id := makeNode(nodeOpts{nodeClaim: func(nc *karpv1.NodeClaim) { nc.Finalizers = []string{karpv1.TerminationFinalizer} }})
+			ExpectSingletonReconciled(ctx, controller)
+			cover(id)
+			Expect(env.Client.Delete(ctx, nc)).To(Succeed())
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
+
+			awsEnv.Clock.Step(time.Minute)
+			awsEnv.EC2API.DescribeCapacityReservationsOutput.Set(&ec2.DescribeCapacityReservationsOutput{CapacityReservations: []ec2types.CapacityReservation{reservation("cr-1", 1)}})
+			awsEnv.CapacityReservationCache.Flush()
+			_, err := awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-1"})
+			Expect(err).ToNot(HaveOccurred())
+			for range 2 {
+				ExpectSingletonReconciled(ctx, controller)
+				Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
+			}
+		})
 		It("should keep holding a pending slot when the instance is briefly missing from DescribeInstances", func() {
 			cr := reservation("cr-1", 2)
 			setReservations([]ec2types.CapacityReservation{cr}, cr)
