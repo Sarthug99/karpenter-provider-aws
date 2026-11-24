@@ -362,9 +362,6 @@ func (p *DefaultProvider) Reboot(ctx context.Context, id string, operationID str
 func (p *DefaultProvider) ModifyCapacityReservationTarget(ctx context.Context, id string, capacityReservationID string) error {
 	out, err := p.Get(ctx, id)
 	if err != nil {
-		if cloudprovider.IsNodeClaimNotFoundError(err) {
-			return err
-		}
 		return fmt.Errorf("%w, %w", ErrModifyNotAttempted, err)
 	}
 	if out.ZoneID != "" && p.zonalshiftProvider.IsZonalShifted(ctx, out.ZoneID) {

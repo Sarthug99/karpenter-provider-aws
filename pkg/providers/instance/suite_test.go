@@ -16,6 +16,7 @@ package instance_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -1170,6 +1171,14 @@ var _ = Describe("InstanceProvider", func() {
 			Entry("enabled without an EFA request", true, false, 1),
 			Entry("disabled despite an EFA request", false, true, 0),
 		)
+	})
+	Context("ModifyCapacityReservationTarget", func() {
+		It("should report a missing instance as not attempted", func() {
+			err := awsEnv.InstanceProvider.ModifyCapacityReservationTarget(ctx, fake.InstanceID(), "cr-1")
+			Expect(errors.Is(err, instance.ErrModifyNotAttempted)).To(BeTrue())
+			Expect(corecloudprovider.IsNodeClaimNotFoundError(err)).To(BeTrue())
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Calls()).To(Equal(0))
+		})
 	})
 	Context("Zonal Shift", func() {
 		var instanceID string
