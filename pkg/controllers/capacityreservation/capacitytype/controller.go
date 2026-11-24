@@ -118,13 +118,21 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	return reconciler.Result{RequeueAfter: time.Minute}, nil
 }
 
-// promote finishes a migration whose controller is now off; coverage it didn't start, like a user's re-target, stays on-demand.
+var reservedLabelKeys = []string{karpv1.CapacityTypeLabelKey, cloudprovider.ReservationIDLabel, v1.LabelCapacityReservationType, v1.LabelCapacityReservationInterruptible}
+
+// promote finishes migrations whose controller is off and syncs a reserved NodeClaim's Nodes; other coverage stays on-demand.
 //
 //nolint:gocyclo
 func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2NodeClass, cpNC, nc *karpv1.NodeClaim) (bool, error) {
 	id := cpNC.Labels[cloudprovider.ReservationIDLabel]
-	if !nc.DeletionTimestamp.IsZero() || nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand || nc.Spec.NodeClassRef == nil ||
-		id == "" || nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget] != id || options.FromContext(ctx).FeatureGates.ReservedCapacityMigration {
+	if !nc.DeletionTimestamp.IsZero() || id == "" {
+		return false, nil
+	}
+	if nc.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved && nc.Labels[cloudprovider.ReservationIDLabel] == id {
+		return c.relabelNodes(ctx, nc, lo.PickByKeys(nc.Labels, reservedLabelKeys))
+	}
+	if nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand || nc.Spec.NodeClassRef == nil ||
+		nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget] != id || options.FromContext(ctx).FeatureGates.ReservedCapacityMigration {
 		return false, nil
 	}
 	nodeClass, ok := nodeClasses[nc.Spec.NodeClassRef.Name]
@@ -141,22 +149,10 @@ func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2
 	if nodeClass == nil || !lo.ContainsBy(nodeClass.Status.CapacityReservations, func(cr v1.CapacityReservation) bool { return cr.ID == id }) {
 		return false, nil
 	}
-	labels := lo.PickByKeys(cpNC.Labels, []string{karpv1.CapacityTypeLabelKey, cloudprovider.ReservationIDLabel,
-		v1.LabelCapacityReservationType, v1.LabelCapacityReservationInterruptible})
-	nodes, err := nodeclaimutils.AllNodesForNodeClaim(ctx, c.kubeClient, nc)
-	if err != nil {
-		return false, serrors.Wrap(fmt.Errorf("listing nodes for nodeclaim, %w", err), "NodeClaim", klog.KObj(nc))
-	}
+	labels := lo.PickByKeys(cpNC.Labels, reservedLabelKeys)
 	// Nodes first, so a failed NodeClaim patch retries both.
-	for _, n := range nodes {
-		if !n.DeletionTimestamp.IsZero() || n.Labels[karpv1.NodeRegisteredLabelKey] != "true" {
-			continue
-		}
-		stored := n.DeepCopy()
-		n.Labels = lo.Assign(n.Labels, labels)
-		if err := c.kubeClient.Patch(ctx, n, client.MergeFrom(stored)); client.IgnoreNotFound(err) != nil {
-			return false, serrors.Wrap(fmt.Errorf("patching node, %w", err), "Node", klog.KObj(n))
-		}
+	if _, err := c.relabelNodes(ctx, nc, labels); err != nil {
+		return false, err
 	}
 	stored := nc.DeepCopy()
 	nc.Labels = lo.Assign(nc.Labels, labels)
@@ -170,6 +166,28 @@ func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2
 		c.crProvider.MarkMigrated(id, instanceID)
 	}
 	return true, nil
+}
+
+// relabelNodes sets labels on the NodeClaim's registered Nodes that don't already carry them.
+func (c *Controller) relabelNodes(ctx context.Context, nc *karpv1.NodeClaim, labels map[string]string) (bool, error) {
+	nodes, err := nodeclaimutils.AllNodesForNodeClaim(ctx, c.kubeClient, nc)
+	if err != nil {
+		return false, serrors.Wrap(fmt.Errorf("listing nodes for nodeclaim, %w", err), "NodeClaim", klog.KObj(nc))
+	}
+	updated := false
+	for _, n := range nodes {
+		if !n.DeletionTimestamp.IsZero() || n.Labels[karpv1.NodeRegisteredLabelKey] != "true" ||
+			lo.EveryBy(lo.Entries(labels), func(e lo.Entry[string, string]) bool { return n.Labels[e.Key] == e.Value }) {
+			continue
+		}
+		stored := n.DeepCopy()
+		n.Labels = lo.Assign(n.Labels, labels)
+		if err := c.kubeClient.Patch(ctx, n, client.MergeFrom(stored)); client.IgnoreNotFound(err) != nil {
+			return false, serrors.Wrap(fmt.Errorf("patching node, %w", err), "Node", klog.KObj(n))
+		}
+		updated = true
+	}
+	return updated, nil
 }
 
 // syncCapacityType will update the capacity type for the given NodeClaim. This accounts for the fact that capacity
@@ -214,6 +232,12 @@ func (c *Controller) syncCapacityType(ctx context.Context, capacityType string, 
 		if n.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeReserved {
 			continue
 		}
+		// Nodes follow their NodeClaim, so don't demote one whose NodeClaim was relabeled after our instance snapshot.
+		if !updated {
+			if fresh, err := c.freshlyReserved(ctx, nc); err != nil || fresh {
+				return false, err
+			}
+		}
 		stored := n.DeepCopy()
 		demote(n.Labels)
 		if err := c.kubeClient.Patch(ctx, n, client.MergeFrom(stored)); client.IgnoreNotFound(err) != nil {
@@ -222,6 +246,14 @@ func (c *Controller) syncCapacityType(ctx context.Context, capacityType string, 
 		updated = true
 	}
 	return updated, nil
+}
+
+func (c *Controller) freshlyReserved(ctx context.Context, nc *karpv1.NodeClaim) (bool, error) {
+	fresh := &karpv1.NodeClaim{}
+	if err := c.kubeClient.Get(ctx, client.ObjectKeyFromObject(nc), fresh); err != nil {
+		return false, client.IgnoreNotFound(serrors.Wrap(fmt.Errorf("getting nodeclaim, %w", err), "NodeClaim", klog.KObj(nc)))
+	}
+	return fresh.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved, nil
 }
 
 func demote(labels map[string]string) {

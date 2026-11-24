@@ -1055,16 +1055,17 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			expectReserved(nc, dup, "cr-1")
 		})
 		It("should keep capacitytype from demoting a flip made after its instance snapshot", func() {
-			nc, node, _ := makeNode()
+			nc, node, id := makeNode()
+			ExpectSingletonReconciled(ctx, controller)
 			ct := capacitytype.NewController(env.Client, listThenRun{CloudProvider: cloudProvider, hook: func() {
-				stored := ExpectExists(ctx, env.Client, nc)
-				flipped := stored.DeepCopy()
-				flipped.Labels = lo.Assign(flipped.Labels, map[string]string{karpv1.CapacityTypeLabelKey: karpv1.CapacityTypeReserved, corecloudprovider.ReservationIDLabel: "cr-1"})
-				Expect(env.Client.Patch(ctx, flipped, client.MergeFrom(stored))).To(Succeed())
+				cover(id)
+				// Completes the migration in between, Node first as complete() does.
+				ExpectSingletonReconciled(ctx, controller)
 			}}, awsEnv.CapacityReservationProvider)
 			ExpectSingletonReconciled(ctx, ct)
-			Expect(ExpectExists(ctx, env.Client, nc).Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
-			_ = node
+			expectReserved(nc, node, "cr-1")
+			ExpectSingletonReconciled(ctx, capacityTypeController)
+			expectReserved(nc, node, "cr-1")
 		})
 	})
 
