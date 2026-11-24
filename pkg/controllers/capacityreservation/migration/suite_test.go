@@ -144,6 +144,20 @@ func (d deniedTarget) ModifyCapacityReservationTarget(ctx context.Context, id, t
 	return d.Provider.ModifyCapacityReservationTarget(ctx, id, target)
 }
 
+// notAttemptedOnce fails the first Modify before it reaches EC2.
+type notAttemptedOnce struct {
+	instance.Provider
+	failed *bool
+}
+
+func (n notAttemptedOnce) ModifyCapacityReservationTarget(ctx context.Context, id, target string) error {
+	if !*n.failed {
+		*n.failed = true
+		return fmt.Errorf("%w, %w", instance.ErrModifyNotAttempted, errors.New("describing instance"))
+	}
+	return n.Provider.ModifyCapacityReservationTarget(ctx, id, target)
+}
+
 // listThenRun runs a hook right after taking the instance snapshot, to interleave a concurrent writer.
 type listThenRun struct {
 	*cloudprovider.CloudProvider
@@ -1313,6 +1327,25 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			awsEnv.Clock.Step(2 * time.Minute)
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(2))
+		})
+		It("should skip a node whose Modify was never attempted, without a failure or attempt", func() {
+			makeNode()
+			makeNode()
+			failed := false
+			c := migration.NewController(awsEnv.Clock, env.Client, cloudProvider, notAttemptedOnce{awsEnv.InstanceProvider, &failed}, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
+			ExpectSingletonReconciled(ctx, c)
+			Expect(failed).To(BeTrue())
+			Expect(modifyCalls()).To(Equal(1))
+			Expect(recorder.Calls(migration.EventReasonFailed)).To(Equal(0))
+			ExpectMetricCounterValue(migration.MigrationAttemptsTotal, 1, map[string]string{"result": "success", "case": "on_demand"})
+			_, found := FindMetricWithLabelValues("karpenter_capacity_reservation_migration_attempts_total", map[string]string{"result": "error"})
+			Expect(found).To(BeFalse())
+			ncs := &karpv1.NodeClaimList{}
+			Expect(env.Client.List(ctx, ncs)).To(Succeed())
+			Expect(lo.CountBy(ncs.Items, func(nc karpv1.NodeClaim) bool {
+				_, ok := nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget]
+				return ok
+			})).To(Equal(1))
 		})
 		It("should skip a node whose instance is gone", func() {
 			nc, _, _ := makeNode()

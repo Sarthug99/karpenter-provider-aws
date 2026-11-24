@@ -641,8 +641,19 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			errs = append(errs, client.IgnoreNotFound(serrors.Wrap(err, "NodeClaim", klog.KObj(nc))))
 			continue
 		}
-		calls++
 		err := c.instanceProvider.ModifyCapacityReservationTarget(ctx, inst.ID, target)
+		if stderrors.Is(err, instance.ErrModifyNotAttempted) {
+			// Nothing reached EC2, so skip the instance this pass without counting an attempt.
+			log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc)).V(1).Info("skipping capacity reservation migration", "error", err.Error())
+			if clearErr := c.clearTarget(ctx, nc); clearErr != nil {
+				errs = append(errs, serrors.Wrap(clearErr, "NodeClaim", klog.KObj(nc)))
+			}
+			if awserrors.IsRateLimitedError(err) {
+				return calls, errs
+			}
+			continue
+		}
+		calls++
 		if err == nil {
 			p.hold(target, inst.ID)
 			c.crProvider.SetPendingMigrations(p.pending)
@@ -691,7 +702,7 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 
 // ambiguous reports whether a failed Modify may still have been applied by EC2.
 func ambiguous(err error) bool {
-	if stderrors.Is(err, instance.ErrModifyNotAttempted) || cloudprovider.IsNodeClaimNotFoundError(err) ||
+	if cloudprovider.IsNodeClaimNotFoundError(err) ||
 		awserrors.IsUnauthorizedOperationError(err) || awserrors.IsRateLimitedError(err) {
 		return false
 	}
