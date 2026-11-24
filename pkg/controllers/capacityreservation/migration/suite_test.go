@@ -1218,6 +1218,17 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(recorder.Calls(migration.EventReasonIncompatible)).To(Equal(1))
 			Expect(recorder.DetectedEvent("Instance is covered by capacity reservation cr-1 and relabeled reserved, but a pod on it requires other labels; the node may drift or lose pods")).To(BeTrue())
 		})
+		It("should say the NodeClaim has no NodePool, rather than that it is gone, when relabeling one without the label", func() {
+			nc, node, id := makeNode()
+			ExpectSingletonReconciled(ctx, controller)
+			nc = ExpectExists(ctx, env.Client, nc)
+			delete(nc.Labels, karpv1.NodePoolLabelKey)
+			ExpectApplied(ctx, env.Client, nc)
+			cover(id)
+			ExpectSingletonReconciled(ctx, controller)
+			expectReserved(nc, node, "cr-1")
+			Expect(recorder.DetectedEvent("Instance is covered by capacity reservation cr-1 and relabeled reserved, but it has no NodePool; the node may drift or lose pods")).To(BeTrue())
+		})
 		It("should converge labels when the migration gate is turned off while a migration is pending", func() {
 			nc, node, id := makeNode()
 			ExpectSingletonReconciled(ctx, controller)

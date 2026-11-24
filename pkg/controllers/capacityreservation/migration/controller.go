@@ -406,6 +406,7 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		return err
 	}
 	if len(ids) == 0 {
+		why = lo.Ternary(why == "" && nc.Labels[karpv1.NodePoolLabelKey] == "", whyNoNodePool, why)
 		c.recorder.Publish(incompatibleEvent(nc, target, incompatibleReasons[why]))
 	}
 	labels := reservedLabels(target)
@@ -439,8 +440,11 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	return nil
 }
 
+const whyNoNodePool = "no_nodepool"
+
 var incompatibleReasons = map[string]string{
 	"":                         "its NodePool is gone",
+	whyNoNodePool:              "it has no NodePool",
 	reasonNodePoolIncompatible: "its NodePool no longer allows it",
 	reasonPodIncompatible:      "a pod on it requires other labels",
 }
