@@ -480,6 +480,32 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(modifyCalls()).To(Equal(1))
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(0))
 		})
+		It("should hold a covered slot in each reservation that covers the instance across erroring passes", func() {
+			cr1, cr2 := reservation("cr-1", 2), reservation("cr-2", 2)
+			setReservations([]ec2types.CapacityReservation{cr1, cr2}, cr1, cr2)
+			retarget := func(nc *karpv1.NodeClaim, id, target string) {
+				inst := ec2Instance(id)
+				inst.CapacityReservationId = lo.ToPtr(target)
+				inst.CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+					CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr(target)},
+				}
+				awsEnv.EC2API.Instances.Store(id, inst)
+				nc = ExpectExists(ctx, env.Client, nc)
+				nc.Annotations = map[string]string{v1.AnnotationCapacityReservationMigrationTarget: target}
+				ExpectApplied(ctx, env.Client, nc)
+			}
+			awsEnv.CapacityReservationProvider.SetAvailableInstanceCount("cr-1", 2)
+			awsEnv.CapacityReservationProvider.SetAvailableInstanceCount("cr-2", 2)
+			nc, _, id := makeNode()
+			// Completing fails on the NodeClaim patch, so every pass errors on this node.
+			c := migration.NewController(awsEnv.Clock, nodeClaimPatchConflict{env.Client}, cloudProvider, awsEnv.InstanceProvider, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
+			retarget(nc, id, "cr-1")
+			ExpectSingletonReconciled(ctx, c)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
+			retarget(nc, id, "cr-2")
+			ExpectSingletonReconciled(ctx, c)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-2")).To(Equal(1))
+		})
 		It("should not treat a NodeClaim deleted before annotation as a failed pass", func() {
 			cr := reservation("cr-1", 2)
 			setReservations([]ec2types.CapacityReservation{cr}, cr)

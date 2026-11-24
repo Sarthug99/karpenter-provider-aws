@@ -97,7 +97,13 @@ type Controller struct {
 	backoff      map[string]backoffEntry
 	cases        map[string]string       // instance ID -> migration case, for metrics only
 	unauthorized map[string]backoffEntry // reservation ID -> backoff, since a deny may be scoped to one reservation
-	covered      sets.Set[string]        // instance IDs marked migrated without completing
+	covered      sets.Set[slot]          // instances marked migrated in a reservation without completing
+}
+
+// slot is an instance in a reservation.
+type slot struct {
+	instanceID    string
+	reservationID string
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, instanceProvider instance.Provider,
@@ -113,7 +119,7 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 		backoff:          map[string]backoffEntry{},
 		cases:            map[string]string{},
 		unauthorized:     map[string]backoffEntry{},
-		covered:          sets.New[string](),
+		covered:          sets.New[slot](),
 	}
 }
 
@@ -744,9 +750,9 @@ func (c *Controller) holdOrCovered(p *pass, target string, inst *instance.Instan
 		p.hold(target, inst.ID)
 		return
 	}
-	if !c.covered.Has(inst.ID) {
+	if s := (slot{instanceID: inst.ID, reservationID: target}); !c.covered.Has(s) {
 		c.crProvider.MarkMigrated(target, inst.ID)
-		c.covered.Insert(inst.ID)
+		c.covered.Insert(s)
 	}
 }
 
@@ -780,9 +786,9 @@ func (c *Controller) prune(instances map[string]*instance.Instance) {
 			delete(c.cases, id)
 		}
 	}
-	for id := range c.covered {
-		if _, ok := instances[id]; !ok {
-			c.covered.Delete(id)
+	for s := range c.covered {
+		if _, ok := instances[s.instanceID]; !ok {
+			c.covered.Delete(s)
 		}
 	}
 	for id, b := range c.unauthorized {
