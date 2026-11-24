@@ -845,6 +845,13 @@ type CapacityReservation struct {
 // contending for the same one.
 func (env *Environment) ExpectCapacityReservationCreated(capacity int32) CapacityReservation {
 	GinkgoHelper()
+	return env.ExpectMatchingCapacityReservationsCreated(1, capacity)[0]
+}
+
+// ExpectMatchingCapacityReservationsCreated creates count targeted ODCRs, each with the given capacity, for the same random
+// instance type and zone.
+func (env *Environment) ExpectMatchingCapacityReservationsCreated(count int, capacity int32) []CapacityReservation {
+	GinkgoHelper()
 	type offering struct{ instanceType, zone string }
 	var offerings []offering
 	for _, family := range capacityReservationFamilies {
@@ -856,14 +863,22 @@ func (env *Environment) ExpectCapacityReservationCreated(capacity int32) Capacit
 	}
 	mutable.Shuffle(offerings)
 	for _, o := range offerings {
-		cr, err := env.tryCreateCapacityReservation(o.instanceType, o.zone, capacity)
-		Expect(err).ToNot(HaveOccurred())
-		if cr != nil {
-			return *cr
+		var created []CapacityReservation
+		for range count {
+			cr, err := env.tryCreateCapacityReservation(o.instanceType, o.zone, capacity)
+			if err != nil || cr == nil {
+				ExpectCapacityReservationsCanceled(env.Context, env.EC2API, lo.Map(created, func(c CapacityReservation, _ int) string { return c.ID })...)
+				Expect(err).ToNot(HaveOccurred())
+				break
+			}
+			created = append(created, *cr)
+		}
+		if len(created) == count {
+			return created
 		}
 	}
-	Fail("failed to create a capacity reservation, all offerings had insufficient capacity")
-	return CapacityReservation{}
+	Fail("failed to create capacity reservations, all offerings had insufficient capacity")
+	return nil
 }
 
 // ExpectCapacityReservationPairCreated creates ODCRs for the large and xlarge sizes of a random instance family in the same
