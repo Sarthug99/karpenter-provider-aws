@@ -38,6 +38,7 @@ import (
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 
 	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/capacityreservation"
 	"github.com/aws/karpenter-provider-aws/pkg/utils"
 )
@@ -89,11 +90,13 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		if !ok {
 			continue
 		}
-		updated, err := lo.Ternary(cpNC.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved,
-			func() (bool, error) { return c.promote(ctx, nodeClasses, cpNC, &ncs.Items[i]) },
-			func() (bool, error) {
-				return c.syncCapacityType(ctx, cpNC.Labels[karpv1.CapacityTypeLabelKey], &ncs.Items[i])
-			})()
+		var updated bool
+		var err error
+		if cpNC.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved {
+			updated, err = c.promote(ctx, nodeClasses, cpNC, &ncs.Items[i])
+		} else {
+			updated, err = c.syncCapacityType(ctx, cpNC.Labels[karpv1.CapacityTypeLabelKey], &ncs.Items[i])
+		}
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -115,16 +118,15 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	return reconciler.Result{RequeueAfter: time.Minute}, nil
 }
 
-// promote relabels an on-demand NodeClaim reserved once EC2 covers its instance with a reservation its EC2NodeClass
-// selects, e.g. after an in-place migration that finished while the migration controller was off. Unselected
-// reservations are left on-demand, as with open ODCRs, so they don't induce capacity reservation drift.
+// promote finishes a migration whose controller is now off; coverage it didn't start, like a user's re-target, stays on-demand.
 //
 //nolint:gocyclo
 func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2NodeClass, cpNC, nc *karpv1.NodeClaim) (bool, error) {
-	if !nc.DeletionTimestamp.IsZero() || nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand || nc.Spec.NodeClassRef == nil {
+	id := cpNC.Labels[cloudprovider.ReservationIDLabel]
+	if !nc.DeletionTimestamp.IsZero() || nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand || nc.Spec.NodeClassRef == nil ||
+		id == "" || nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget] != id || options.FromContext(ctx).FeatureGates.ReservedCapacityMigration {
 		return false, nil
 	}
-	id := cpNC.Labels[cloudprovider.ReservationIDLabel]
 	nodeClass, ok := nodeClasses[nc.Spec.NodeClassRef.Name]
 	if !ok {
 		nodeClass = &v1.EC2NodeClass{}
@@ -136,7 +138,7 @@ func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2
 		}
 		nodeClasses[nc.Spec.NodeClassRef.Name] = nodeClass
 	}
-	if id == "" || nodeClass == nil || !lo.ContainsBy(nodeClass.Status.CapacityReservations, func(cr v1.CapacityReservation) bool { return cr.ID == id }) {
+	if nodeClass == nil || !lo.ContainsBy(nodeClass.Status.CapacityReservations, func(cr v1.CapacityReservation) bool { return cr.ID == id }) {
 		return false, nil
 	}
 	labels := lo.PickByKeys(cpNC.Labels, []string{karpv1.CapacityTypeLabelKey, cloudprovider.ReservationIDLabel,
@@ -158,6 +160,8 @@ func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2
 	}
 	stored := nc.DeepCopy()
 	nc.Labels = lo.Assign(nc.Labels, labels)
+	delete(nc.Annotations, v1.AnnotationCapacityReservationMigrationTarget)
+	delete(nc.Annotations, v1.AnnotationCapacityReservationMigrationRequestedAt)
 	if err := c.kubeClient.Patch(ctx, nc, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 		return false, client.IgnoreNotFound(serrors.Wrap(fmt.Errorf("patching nodeclaim, %w", err), "NodeClaim", klog.KObj(nc)))
 	}
