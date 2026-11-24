@@ -648,6 +648,7 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			return c.clk.Now().Before(c.unauthorized[id]) || c.clk.Now().Before(c.denied[slot{instanceID: inst.ID, reservationID: id}].next)
 		})
 		if len(reservations) == 0 {
+			p.ineligible[reasonUnauthorized]++
 			continue
 		}
 		target := lo.MinBy(reservations, func(a, b string) bool { return preferred(a, b, cand.endTimes, budgets) })

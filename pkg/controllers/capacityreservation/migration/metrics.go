@@ -39,6 +39,7 @@ const (
 	reasonNoCapacity           = "no_capacity"
 	reasonNoCompatibleCR       = "no_compatible_cr"
 	reasonZonalShift           = "zonal_shift"
+	reasonUnauthorized         = "unauthorized"
 )
 
 var (
@@ -75,6 +76,7 @@ var (
 			{Name: reasonNoCapacity, Help: "Every compatible capacity reservation is full."},
 			{Name: reasonNoCompatibleCR, Help: "No capacity reservation selected by the EC2NodeClass matches the instance."},
 			{Name: reasonZonalShift, Help: "The instance's availability zone is zonally shifted away from."},
+			{Name: reasonUnauthorized, Help: "EC2 denied moving the instance into every compatible capacity reservation with a free slot, so they are backing off."},
 		},
 	}
 
