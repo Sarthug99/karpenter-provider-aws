@@ -106,6 +106,16 @@ func (c nodeClaimPatchNotFound) Patch(ctx context.Context, obj client.Object, pa
 	return c.Client.Patch(ctx, obj, patch, opts...)
 }
 
+// nodeClaimPatchConflict simulates a NodeClaim updated between the List and a Patch.
+type nodeClaimPatchConflict struct{ client.Client }
+
+func (c nodeClaimPatchConflict) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if _, ok := obj.(*karpv1.NodeClaim); ok {
+		return apierrors.NewConflict(schema.GroupResource{Group: "karpenter.sh", Resource: "nodeclaims"}, obj.GetName(), errors.New("modified"))
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
 // listThenRun runs a hook right after taking the instance snapshot, to interleave a concurrent writer.
 type listThenRun struct {
 	*cloudprovider.CloudProvider
@@ -410,8 +420,10 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			// The pending node's reservation lookup fails; the second node must not get the slot it still holds.
 			awsEnv.CapacityReservationCache.Flush()
 			awsEnv.EC2API.NextError.Set(&smithy.GenericAPIError{Code: "RequestLimitExceeded"})
-			_, err := controller.Reconcile(ctx)
-			Expect(err).To(HaveOccurred())
+			// The error is logged and the pass keeps its regular cadence instead of a rate-limited retry.
+			result, err := controller.Reconcile(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(time.Minute))
 			Expect(modifyCalls()).To(Equal(1))
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(0))
 		})
@@ -423,6 +435,16 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			result, err := c.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.RequeueAfter).To(Equal(time.Minute))
+			Expect(modifyCalls()).To(Equal(0))
+		})
+		It("should retry soon after a conflict-only pass that made no Modify calls", func() {
+			cr := reservation("cr-1", 2)
+			setReservations([]ec2types.CapacityReservation{cr}, cr)
+			makeNode()
+			c := migration.NewController(awsEnv.Clock, nodeClaimPatchConflict{env.Client}, cloudProvider, awsEnv.InstanceProvider, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
+			result, err := c.Reconcile(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(5 * time.Second))
 			Expect(modifyCalls()).To(Equal(0))
 		})
 		It("should not re-issue when DescribeInstances lags its own Modify", func() {

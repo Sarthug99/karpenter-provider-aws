@@ -26,6 +26,7 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/smithy-go"
 	"github.com/awslabs/operatorpkg/reconciler"
+	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/awslabs/operatorpkg/singleton"
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -60,6 +62,7 @@ import (
 
 const (
 	maxModifyCallsPerPass = 10
+	conflictRequeue       = 5 * time.Second
 	stallThreshold        = 30 * time.Minute
 	// Coverage can take up to stallThreshold, so a reservation ending sooner than this would barely hold the node.
 	minReservationRemaining = time.Hour
@@ -149,11 +152,13 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 	nodeClaims, err := nodeclaimutils.ListManaged(ctx, c.kubeClient, c.cloudProvider)
 	if err != nil {
-		return reconciler.Result{}, fmt.Errorf("listing nodeclaims, %w", err)
+		log.FromContext(ctx).Error(err, "failed listing nodeclaims")
+		return reconciler.Result{RequeueAfter: time.Minute}, nil
 	}
 	instances, err := c.instanceProvider.List(ctx)
 	if err != nil {
-		return reconciler.Result{}, fmt.Errorf("listing instances, %w", err)
+		log.FromContext(ctx).Error(err, "failed listing instances")
+		return reconciler.Result{RequeueAfter: time.Minute}, nil
 	}
 	byID := lo.KeyBy(instances, func(i *instance.Instance) string { return i.ID })
 	p := &pass{
@@ -190,7 +195,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		}
 		free, err := c.reconcileTracked(ctx, p, nc, inst)
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, serrors.Wrap(err, "NodeClaim", klog.KObj(nc)))
 			// Stay conservative: an error must not release a slot this instance may hold.
 			p.hold(target, id)
 			p.hold(inst.CapacityReservationState.TargetID, id)
@@ -207,7 +212,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	for _, u := range unclaimed {
 		cand, err := c.eligible(ctx, p, u.nodeClaim, u.instance)
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, serrors.Wrap(err, "NodeClaim", klog.KObj(u.nodeClaim)))
 			continue
 		}
 		if cand != nil {
@@ -225,15 +230,16 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		}
 		return candidates[i].nodeClaim.Name < candidates[j].nodeClaim.Name
 	})
-	errs = append(errs, c.migrate(ctx, p, candidates)...)
+	calls, migrateErrs := c.migrate(ctx, p, candidates)
+	errs = lo.Compact(append(errs, migrateErrs...))
 	c.publishGauges(p)
 
-	errs = lo.Compact(errs)
-	if len(errs) != 0 {
-		if lo.EveryBy(errs, func(err error) bool { return errors.IsConflict(err) }) {
-			return reconciler.Result{Requeue: true}, nil
-		}
-		return reconciler.Result{}, multierr.Combine(errs...)
+	for _, err := range errs {
+		log.FromContext(ctx).Error(err, "failed reconciling capacity reservation migration")
+	}
+	// Errors keep the regular cadence; a conflict-only pass with no Modify calls retries soon without a fresh call budget.
+	if len(errs) != 0 && calls == 0 && lo.EveryBy(errs, func(err error) bool { return errors.IsConflict(err) }) {
+		return reconciler.Result{RequeueAfter: conflictRequeue}, nil
 	}
 	return reconciler.Result{RequeueAfter: time.Minute}, nil
 }
@@ -597,10 +603,10 @@ func preferred(a, b string, endTimes map[string]time.Time, budgets map[string]in
 }
 
 //nolint:gocyclo
-func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candidate) []error {
+func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candidate) (int, []error) {
 	var errs []error
 	if c.clk.Now().Before(c.unauthorized.next) {
-		return nil
+		return 0, nil
 	}
 	calls := 0
 	for _, cand := range candidates {
@@ -621,7 +627,7 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 		nc, inst := cand.nodeClaim, cand.instance
 		// Record intent first so a crash after the call still leaves durable state for the ledger.
 		if err := c.setTarget(ctx, nc, target); err != nil {
-			errs = append(errs, client.IgnoreNotFound(err))
+			errs = append(errs, client.IgnoreNotFound(serrors.Wrap(err, "NodeClaim", klog.KObj(nc))))
 			continue
 		}
 		calls++
@@ -645,10 +651,10 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			c.backOff(inst.ID)
 			c.recorder.Publish(failedEvent(nc, target, err))
 			log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Error(err, "failed re-targeting instance at capacity reservation, outcome unknown")
-			return errs
+			return calls, errs
 		}
 		if clearErr := c.clearTarget(ctx, nc); clearErr != nil {
-			errs = append(errs, clearErr)
+			errs = append(errs, serrors.Wrap(clearErr, "NodeClaim", klog.KObj(nc)))
 		}
 		switch {
 		case cloudprovider.IsNodeClaimNotFoundError(err):
@@ -657,10 +663,10 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultUnauthorized, caseLabel.Name: cand.caseLabel})
 			c.unauthorized = c.nextBackoff(c.unauthorized)
 			log.FromContext(ctx).WithValues("retry-after", c.unauthorized.delay).Error(err, "missing permission ec2:ModifyInstanceCapacityReservationAttributes, skipping capacity reservation migration")
-			return errs
+			return calls, errs
 		case awserrors.IsRateLimitedError(err):
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultThrottled, caseLabel.Name: cand.caseLabel})
-			return errs
+			return calls, errs
 		default:
 			_, isAPIErr := lo.ErrorsAs[smithy.APIError](err)
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: lo.Ternary(isAPIErr, resultClientError, resultError), caseLabel.Name: cand.caseLabel})
@@ -669,7 +675,7 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Error(err, "failed re-targeting instance at capacity reservation")
 		}
 	}
-	return errs
+	return calls, errs
 }
 
 // ambiguous reports whether a failed Modify may still have been applied by EC2.
