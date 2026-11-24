@@ -1231,6 +1231,13 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			ExpectMetricCounterValue(migration.MigrationAttemptsTotal, 1, map[string]string{"result": "client_error", "case": "on_demand"})
 		})
+		It("should treat an expired request signature as a definite rejection", func() {
+			nc, _, _ := makeNode()
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "RequestExpired", Fault: smithy.FaultClient}, fake.MaxCalls(1))
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(ExpectExists(ctx, env.Client, nc).Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationTarget))
+			ExpectMetricCounterValue(migration.MigrationAttemptsTotal, 1, map[string]string{"result": "client_error", "case": "on_demand"})
+		})
 		DescribeTable("should keep the annotation and hold the slot when the outcome is unknown",
 			func(err error, applied bool) {
 				cr = reservation("cr-1", 1)

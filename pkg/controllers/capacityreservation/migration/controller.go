@@ -72,7 +72,7 @@ const (
 )
 
 // serverErrorCodes are EC2 faults after which a Modify may still have been applied.
-var serverErrorCodes = sets.New("InternalError", "InternalFailure", "ServiceUnavailable", "Unavailable", "RequestTimeout", "RequestExpired")
+var serverErrorCodes = sets.New("InternalError", "InternalFailure", "ServiceUnavailable", "Unavailable", "RequestTimeout")
 
 // Enabled reports whether the controller should run; it needs core ReservedCapacity for reserved offerings and labels.
 func Enabled(ctx context.Context) bool {
