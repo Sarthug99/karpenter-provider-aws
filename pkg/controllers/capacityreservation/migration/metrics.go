@@ -108,7 +108,7 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: subsystem,
 			Name:      "pending",
-			Help:      "Number of nodes re-targeted at a capacity reservation that EC2 doesn't report covered yet.",
+			Help:      "Number of nodes re-targeted at a capacity reservation that EC2 doesn't report covered yet, excluding stalled ones.",
 		},
 		[]opmetrics.Label{reservationIDLabel},
 		opmetrics.Alpha,

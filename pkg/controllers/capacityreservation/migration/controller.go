@@ -316,13 +316,15 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 		// The target died while pending; this is now the orphaned case.
 		return true, c.clearTarget(ctx, nc)
 	}
-	p.hold(target, inst.ID)
 	if requestedAt, err := time.Parse(time.RFC3339, nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]); err == nil {
 		if pendingFor := c.clk.Since(requestedAt); pendingFor > stallThreshold {
+			// EC2 covers a re-target as soon as a slot is free, so a hold this old only keeps a slot from launches.
 			p.stalled++
 			c.recorder.Publish(stalledEvent(nc, target, pendingFor))
+			return false, nil
 		}
 	}
+	p.hold(target, inst.ID)
 	return false, nil
 }
 

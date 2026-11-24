@@ -742,16 +742,22 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(modifyCalls()).To(Equal(0))
 		})
-		It("should stall a node that stays uncovered for 30 minutes without re-targeting it", func() {
+		It("should stall a node that stays uncovered for 30 minutes and release its slot, without re-targeting it", func() {
 			cr := reservation("cr-1", 2)
 			setReservations([]ec2types.CapacityReservation{cr}, cr)
-			nc, _, _ := makeNode()
+			nc, node, id := makeNode()
 			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
 			awsEnv.Clock.Step(31 * time.Minute)
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(recorder.Calls(migration.EventReasonStalled)).To(Equal(1))
 			Expect(modifyCalls()).To(Equal(1))
 			Expect(ExpectExists(ctx, env.Client, nc).Annotations).To(HaveKeyWithValue(v1.AnnotationCapacityReservationMigrationTarget, "cr-1"))
+			// The slot is released for launches, but coverage is still followed.
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(2))
+			cover(id)
+			ExpectSingletonReconciled(ctx, controller)
+			expectReserved(nc, node, "cr-1")
 		})
 	})
 

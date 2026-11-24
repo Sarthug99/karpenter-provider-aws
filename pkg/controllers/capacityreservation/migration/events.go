@@ -67,7 +67,7 @@ func stalledEvent(nc *karpv1.NodeClaim, reservationID string, pendingFor time.Du
 		InvolvedObject: nc,
 		Type:           corev1.EventTypeWarning,
 		Reason:         EventReasonStalled,
-		Message:        fmt.Sprintf("Instance not covered by capacity reservation %s after %s, waiting for a free slot", reservationID, pendingFor.Round(time.Minute)),
+		Message:        fmt.Sprintf("Instance not covered by capacity reservation %s after %s, no longer holding a slot for it", reservationID, pendingFor.Round(time.Minute)),
 		DedupeValues:   []string{string(nc.UID), reservationID},
 		DedupeTimeout:  time.Hour,
 	}
