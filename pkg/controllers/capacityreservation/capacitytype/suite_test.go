@@ -230,15 +230,15 @@ var _ = Describe("Capacity Reservation Capacity Type Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			expectCapacityType(karpv1.CapacityTypeOnDemand)
 		})
-		It("should not promote an unannotated node whose NodePool requires on-demand", func() {
+		It("should still finish an annotated migration whose NodePool now requires on-demand", func() {
 			nodePool := coretest.NodePool(karpv1.NodePool{Spec: karpv1.NodePoolSpec{Template: karpv1.NodeClaimTemplate{Spec: karpv1.NodeClaimTemplateSpec{
 				Requirements: []karpv1.NodeSelectorRequirementWithMinValues{{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeOnDemand}}},
 			}}}})
 			nodeClaim.Labels[karpv1.NodePoolLabelKey] = nodePool.Name
-			nodeClaim.Annotations = nil
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectSingletonReconciled(ctx, controller)
-			expectCapacityType(karpv1.CapacityTypeOnDemand)
+			// Labels follow EC2, as in the migration controller; requirements drift handles the NodePool.
+			expectCapacityType(karpv1.CapacityTypeReserved)
 		})
 		It("should not promote when the annotation names another reservation", func() {
 			nodeClaim.Annotations[v1.AnnotationCapacityReservationMigrationTarget] = "cr-other"
