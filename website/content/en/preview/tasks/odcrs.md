@@ -137,10 +137,9 @@ Karpenter considers two kinds of nodes:
 A node is moved only when all of the following hold:
 - its NodePool requirements allow `karpenter.sh/capacity-type: reserved` and the reservation's labels
 - every pod on it, including DaemonSet pods and excluding static pods, can run on a reserved node in that reservation. Only required node affinity and `nodeSelector` are checked; preferred affinity doesn't block a move.
-- the reservation is in the EC2NodeClass's `status.capacityReservations`, is a `default` (not capacity block or interruptible) reservation, matches the node's instance type, zone, platform and tenancy, and has a free slot
+- the reservation is in the EC2NodeClass's `status.capacityReservations`, is a `default` (not capacity block or interruptible) reservation, matches the node's instance type, zone, platform and tenancy, isn't in a placement group or on an Outpost, and has a free slot
 
 Karpenter skips nodes in an availability zone that is zonally shifted away from, and reservations that end within an hour.
-Among the reservations a node can move into, it prefers ones without an end date, then the latest end date, then the most free slots.
 Slots already promised to reserved NodeClaims that haven't launched yet aren't used.
 
 Karpenter re-targets the instance and keeps the node labeled `on-demand` until EC2 reports it covered by the reservation. Coverage is usually reported within seconds.
@@ -149,7 +148,7 @@ No node is drained or replaced.
 Labels follow what EC2 reports: once the instance is covered, Karpenter labels it `reserved` even if the NodePool or a pod stopped allowing that while the move was pending, and emits a `CapacityReservationMigrationIncompatible` warning event.
 [Drift]({{<ref "../concepts/disruption#drift" >}}) then replaces the node if its NodePool no longer allows `reserved`.
 If the EC2NodeClass no longer selects the reservation, the node stays labeled `on-demand`, as with an `open` reservation match, and Karpenter emits a `CapacityReservationMigrationNotRelabeled` event. It relabels the node if the reservation is selected again.
-This labeling doesn't depend on the gate, so a move still pending when the gate is turned off is labeled `reserved` once EC2 covers it.
+If the gate is turned off while a move is pending, Karpenter still labels the node `reserved` once EC2 covers it. With the gate off, instances re-targeted outside Karpenter stay labeled `on-demand`.
 
 {{% alert title="Note" color="primary" %}}
 Selecting a capacity reservation in an EC2NodeClass now also lets running nodes move into it, not only new launches.
@@ -158,9 +157,7 @@ To keep free slots for new launches, select fewer reservations or restrict the N
 
 {{% alert title="Warning" color="warning" %}}
 Rolling back to a Karpenter version without this classification labels migrated nodes `on-demand` again. NodePools that only allow `reserved` replace them, and DaemonSet pods that require `reserved` are removed from them.
-{{% /alert %}}
 
-{{% alert title="Warning" color="warning" %}}
 The move can't be undone. Once an instance targets a capacity reservation, it can't return to on-demand without being replaced.
 Nodes launched before `ReservedCapacity` was enabled have the `open` capacity reservation preference and are never moved.
 {{% /alert %}}
