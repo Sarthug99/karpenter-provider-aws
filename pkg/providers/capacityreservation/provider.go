@@ -88,6 +88,7 @@ func (p *DefaultProvider) List(ctx context.Context, selectorTerms ...v1.Capacity
 		return p.filterReservations(reservations), nil
 	}
 	for _, q := range queries {
+		requestedAt := p.clk.Now()
 		paginator := ec2.NewDescribeCapacityReservationsPaginator(p.ec2api, q.DescribeCapacityReservationsInput())
 		var queryReservations []*ec2types.CapacityReservation
 		for paginator.HasMorePages() {
@@ -104,7 +105,7 @@ func (p *DefaultProvider) List(ctx context.Context, selectorTerms ...v1.Capacity
 		}
 		p.syncAvailability(lo.SliceToMap(queryReservations, func(r *ec2types.CapacityReservation) (string, int) {
 			return *r.CapacityReservationId, int(*r.AvailableInstanceCount)
-		}))
+		}), requestedAt)
 		p.reservationCache.SetDefault(q.CacheKey(), queryReservations)
 		reservations = append(reservations, queryReservations...)
 	}

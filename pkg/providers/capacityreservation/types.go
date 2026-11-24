@@ -123,7 +123,8 @@ type availabilityCacheEntry struct {
 	syncTime time.Time
 }
 
-func (c *availabilityCache) syncAvailability(availability map[string]int) {
+// syncAvailability stores counts read by a DescribeCapacityReservations call issued at requestedAt.
+func (c *availabilityCache) syncAvailability(availability map[string]int, requestedAt time.Time) {
 	now := c.clk.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -133,7 +134,8 @@ func (c *availabilityCache) syncAvailability(availability map[string]int) {
 			syncTime: now,
 		})
 		for instanceID, coveredAt := range c.migrated[id] {
-			if coveredAt.Before(now) {
+			// A read issued before coverage may not count the instance yet.
+			if coveredAt.Before(requestedAt) {
 				delete(c.migrated[id], instanceID)
 			}
 		}
