@@ -492,6 +492,30 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(*awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Pop().CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationId).To(Equal("cr-b"))
 		})
+		It("should prefer reservations that never end, then the latest end, over free slots", func() {
+			ends := func(d time.Duration) func(*ec2types.CapacityReservation) {
+				return func(cr *ec2types.CapacityReservation) { cr.EndDate = lo.ToPtr(awsEnv.Clock.Now().Add(d)) }
+			}
+			soon, later, never := reservation("cr-a", 5, ends(2*time.Hour)), reservation("cr-b", 2, ends(48*time.Hour)), reservation("cr-c", 1)
+			setReservations([]ec2types.CapacityReservation{soon, later, never}, soon, later, never)
+			makeNode()
+			makeNode()
+			makeNode()
+			ExpectSingletonReconciled(ctx, controller)
+			var targets []string
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.ForEach(func(in *ec2.ModifyInstanceCapacityReservationAttributesInput) {
+				targets = append(targets, *in.CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationId)
+			})
+			Expect(targets).To(ConsistOf("cr-c", "cr-b", "cr-b"))
+		})
+		It("should skip reservations ending within the hour", func() {
+			ending := reservation("cr-1", 5, func(cr *ec2types.CapacityReservation) { cr.EndDate = lo.ToPtr(awsEnv.Clock.Now().Add(30 * time.Minute)) })
+			setReservations([]ec2types.CapacityReservation{ending}, ending)
+			makeNode()
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(0))
+			ExpectMetricGaugeValue(migration.MigrationIneligible, 1, map[string]string{"reason": "no_compatible_cr"})
+		})
 		It("should only use reservations in the EC2NodeClass status", func() {
 			inStatus, notInStatus := reservation("cr-1", 0), reservation("cr-2", 5)
 			setReservations([]ec2types.CapacityReservation{inStatus, notInStatus}, inStatus)

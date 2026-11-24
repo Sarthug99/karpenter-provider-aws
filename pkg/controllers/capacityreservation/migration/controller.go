@@ -61,6 +61,8 @@ import (
 const (
 	maxModifyCallsPerPass   = 10
 	stallThreshold          = 30 * time.Minute
+	// Coverage can take up to stallThreshold, so a reservation ending sooner than this would barely hold the node.
+	minReservationRemaining = time.Hour
 	initialBackoff          = 5 * time.Minute
 	maxBackoff              = time.Hour
 	// DescribeInstances can lag a Modify, so a missing target isn't trusted until this long after the call.
@@ -138,6 +140,7 @@ type candidate struct {
 	instance     *instance.Instance
 	caseLabel    string
 	reservations []string
+	endTimes     map[string]time.Time // reservation ID -> end, zero if it never ends
 }
 
 //nolint:gocyclo
@@ -470,7 +473,7 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	if err != nil || nodeClass == nil {
 		return nil, err
 	}
-	reservations, err := c.compatibleReservations(ctx, p, nodeClass, inst, state.TargetID)
+	reservations, endTimes, err := c.compatibleReservations(ctx, p, nodeClass, inst, state.TargetID)
 	if err != nil {
 		return nil, err
 	}
@@ -488,7 +491,7 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		}
 		return nil, nil
 	}
-	return &candidate{nodeClaim: nc, node: node, instance: inst, caseLabel: migrationCase, reservations: reservations}, nil
+	return &candidate{nodeClaim: nc, node: node, instance: inst, caseLabel: migrationCase, reservations: reservations, endTimes: endTimes}, nil
 }
 
 // filterCompatible keeps the reservations whose labels neither the NodePool nor any pod on the nodes rejects, else returns why.
@@ -527,24 +530,26 @@ func (c *Controller) filterCompatible(ctx context.Context, p *pass, nc *karpv1.N
 	return ids, "", nil
 }
 
-// compatibleReservations returns the NodeClass's reservations the instance can be re-targeted at, ignoring capacity.
+// compatibleReservations returns the NodeClass's reservations the instance can be re-targeted at, ignoring capacity,
+// with their end times.
 //
 //nolint:gocyclo
-func (c *Controller) compatibleReservations(ctx context.Context, p *pass, nodeClass *v1.EC2NodeClass, inst *instance.Instance, source string) ([]string, error) {
+func (c *Controller) compatibleReservations(ctx context.Context, p *pass, nodeClass *v1.EC2NodeClass, inst *instance.Instance, source string) ([]string, map[string]time.Time, error) {
 	raw, ok := p.raw[nodeClass.Name]
 	if !ok {
 		reservations, err := c.crProvider.List(ctx, nodeClass.Spec.CapacityReservationSelectorTerms...)
 		if err != nil {
-			return nil, fmt.Errorf("listing capacity reservations, %w", err)
+			return nil, nil, fmt.Errorf("listing capacity reservations, %w", err)
 		}
 		raw = lo.KeyBy(reservations, func(r *ec2types.CapacityReservation) string { return lo.FromPtr(r.CapacityReservationId) })
 		p.raw[nodeClass.Name] = raw
 	}
 	// An unknown platform could pick a reservation EC2 won't match, and the move can't be undone.
 	if inst.CapacityReservationState.Platform == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
-	return lo.FilterMap(nodeClass.Status.CapacityReservations, func(cr v1.CapacityReservation, _ int) (string, bool) {
+	endTimes := map[string]time.Time{}
+	ids := lo.FilterMap(nodeClass.Status.CapacityReservations, func(cr v1.CapacityReservation, _ int) (string, bool) {
 		if cr.ReservationType != v1.CapacityReservationTypeDefault || cr.Interruptible || cr.State != v1.CapacityReservationStateActive ||
 			cr.InstanceType != string(inst.Type) || cr.AvailabilityZone != inst.Zone || cr.ID == source {
 			return "", false
@@ -556,8 +561,27 @@ func (c *Controller) compatibleReservations(ctx context.Context, p *pass, nodeCl
 			string(lo.Ternary(r.Tenancy == "", ec2types.CapacityReservationTenancyDefault, r.Tenancy)) != inst.Tenancy {
 			return "", false
 		}
+		if end := lo.FromPtr(r.EndDate); !end.IsZero() {
+			if end.Sub(c.clk.Now()) < minReservationRemaining {
+				return "", false
+			}
+			endTimes[cr.ID] = end
+		}
 		return cr.ID, true
-	}), nil
+	})
+	return ids, endTimes, nil
+}
+
+// preferred orders reservations that never end first, then by latest end, then by most free slots, then by ID.
+func preferred(a, b string, endTimes map[string]time.Time, budgets map[string]int) bool {
+	ea, eb := endTimes[a], endTimes[b]
+	if !ea.Equal(eb) {
+		return ea.IsZero() || (!eb.IsZero() && ea.After(eb))
+	}
+	if budgets[a] != budgets[b] {
+		return budgets[a] > budgets[b]
+	}
+	return a < b
 }
 
 //nolint:gocyclo
@@ -578,12 +602,7 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			p.ineligible[reasonNoCapacity]++
 			continue
 		}
-		sort.SliceStable(reservations, func(i, j int) bool {
-			if budgets[reservations[i]] != budgets[reservations[j]] {
-				return budgets[reservations[i]] > budgets[reservations[j]]
-			}
-			return reservations[i] < reservations[j]
-		})
+		sort.SliceStable(reservations, func(i, j int) bool { return preferred(reservations[i], reservations[j], cand.endTimes, budgets) })
 		target := reservations[0]
 		nc, inst := cand.nodeClaim, cand.instance
 		// Record intent first so a crash after the call still leaves durable state for the ledger.
