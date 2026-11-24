@@ -49,6 +49,7 @@ import (
 	"github.com/aws/karpenter-provider-aws/pkg/fake"
 	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/capacityreservation"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/instance"
 	"github.com/aws/karpenter-provider-aws/pkg/test"
 	"github.com/aws/karpenter-provider-aws/pkg/utils"
 
@@ -126,6 +127,21 @@ type failingList struct {
 func (f failingList) List(context.Context, ...v1.CapacityReservationSelectorTerm) ([]*ec2types.CapacityReservation, error) {
 	*f.calls++
 	return nil, &smithy.GenericAPIError{Code: "RequestLimitExceeded"}
+}
+
+// deniedTarget fails every Modify at one reservation as unauthorized, as a resource-scoped deny would.
+type deniedTarget struct {
+	instance.Provider
+	denied string
+	calls  *int
+}
+
+func (d deniedTarget) ModifyCapacityReservationTarget(ctx context.Context, id, target string) error {
+	if target == d.denied {
+		*d.calls++
+		return &smithy.GenericAPIError{Code: "UnauthorizedOperation", Fault: smithy.FaultClient}
+	}
+	return d.Provider.ModifyCapacityReservationTarget(ctx, id, target)
 }
 
 // listThenRun runs a hook right after taking the instance snapshot, to interleave a concurrent writer.
@@ -1205,7 +1221,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(2))
 		})
-		It("should back off every instance, exponentially, while unauthorized", func() {
+		It("should back off a reservation, exponentially, while unauthorized", func() {
 			makeNode()
 			makeNode()
 			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "UnauthorizedOperation", Fault: smithy.FaultClient}, fake.MaxCalls(2))
@@ -1222,6 +1238,49 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(modifyCalls()).To(Equal(2))
 			awsEnv.Clock.Step(5 * time.Minute)
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(2))
+		})
+		It("should keep using other reservations while one is unauthorized", func() {
+			denied, allowed := reservation("cr-denied", 5), reservation("cr-allowed", 2)
+			setReservations([]ec2types.CapacityReservation{denied, allowed}, denied, allowed)
+			makeNode()
+			makeNode()
+			deniedCalls := 0
+			c := migration.NewController(awsEnv.Clock, env.Client, cloudProvider, deniedTarget{awsEnv.InstanceProvider, "cr-denied", &deniedCalls}, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
+			ExpectSingletonReconciled(ctx, c)
+			Expect(deniedCalls).To(Equal(1))
+			Expect(modifyCalls()).To(Equal(1))
+			awsEnv.Clock.Step(time.Minute)
+			ExpectSingletonReconciled(ctx, c)
+			Expect(deniedCalls).To(Equal(1))
+			Expect(modifyCalls()).To(Equal(2))
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.ForEach(func(in *ec2.ModifyInstanceCapacityReservationAttributesInput) {
+				Expect(*in.CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationId).To(Equal("cr-allowed"))
+			})
+		})
+		It("should cap the unauthorized backoff at an hour and reset it after a success", func() {
+			makeNode()
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "UnauthorizedOperation", Fault: smithy.FaultClient}, fake.MaxCalls(6))
+			for i, delay := range []time.Duration{5, 10, 20, 40, 60, 60} {
+				ExpectSingletonReconciled(ctx, controller)
+				Expect(modifyCalls()).To(Equal(i + 1))
+				awsEnv.Clock.Step((delay - 1) * time.Minute)
+				ExpectSingletonReconciled(ctx, controller)
+				Expect(modifyCalls()).To(Equal(i + 1))
+				awsEnv.Clock.Step(2 * time.Minute)
+			}
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(1))
+
+			makeNode()
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "UnauthorizedOperation", Fault: smithy.FaultClient}, fake.MaxCalls(1))
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(8))
+			awsEnv.Clock.Step(4 * time.Minute)
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(8))
+			awsEnv.Clock.Step(2 * time.Minute)
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(2))
 		})

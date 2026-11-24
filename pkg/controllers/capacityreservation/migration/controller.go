@@ -96,8 +96,8 @@ type Controller struct {
 	recorder         events.Recorder
 
 	backoff      map[string]backoffEntry
-	cases        map[string]string // instance ID -> migration case, for metrics only
-	unauthorized backoffEntry      // a missing permission is role-wide, so it backs off every instance
+	cases        map[string]string       // instance ID -> migration case, for metrics only
+	unauthorized map[string]backoffEntry // reservation ID -> backoff, since a deny may be scoped to one reservation
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, instanceProvider instance.Provider,
@@ -112,6 +112,7 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 		recorder:         recorder,
 		backoff:          map[string]backoffEntry{},
 		cases:            map[string]string{},
+		unauthorized:     map[string]backoffEntry{},
 	}
 }
 
@@ -612,9 +613,6 @@ func preferred(a, b string, endTimes map[string]time.Time, budgets map[string]in
 //nolint:gocyclo
 func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candidate) (int, []error) {
 	var errs []error
-	if c.clk.Now().Before(c.unauthorized.next) {
-		return 0, nil
-	}
 	calls := 0
 	for _, cand := range candidates {
 		if calls >= maxModifyCallsPerPass {
@@ -627,6 +625,10 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 		reservations := lo.Filter(cand.reservations, func(id string, _ int) bool { return budgets[id] > 0 })
 		if len(reservations) == 0 {
 			p.ineligible[reasonNoCapacity]++
+			continue
+		}
+		reservations = lo.Reject(reservations, func(id string, _ int) bool { return c.clk.Now().Before(c.unauthorized[id].next) })
+		if len(reservations) == 0 {
 			continue
 		}
 		sort.SliceStable(reservations, func(i, j int) bool { return preferred(reservations[i], reservations[j], cand.endTimes, budgets) })
@@ -643,7 +645,7 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			p.hold(target, inst.ID)
 			c.crProvider.SetPendingMigrations(p.pending)
 			delete(c.backoff, inst.ID)
-			c.unauthorized = backoffEntry{}
+			delete(c.unauthorized, target)
 			c.cases[inst.ID] = cand.caseLabel
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultSuccess, caseLabel.Name: cand.caseLabel})
 			c.recorder.Publish(startedEvent(nc, target))
@@ -668,9 +670,9 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			continue
 		case awserrors.IsUnauthorizedOperationError(err):
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultUnauthorized, caseLabel.Name: cand.caseLabel})
-			c.unauthorized = c.nextBackoff(c.unauthorized)
-			log.FromContext(ctx).WithValues("retry-after", c.unauthorized.delay).Error(err, "missing permission ec2:ModifyInstanceCapacityReservationAttributes, skipping capacity reservation migration")
-			return calls, errs
+			c.unauthorized[target] = c.nextBackoff(c.unauthorized[target])
+			log.FromContext(ctx).WithValues("capacity-reservation-id", target, "retry-after", c.unauthorized[target].delay).Error(err,
+				"not authorized for ec2:ModifyInstanceCapacityReservationAttributes, skipping capacity reservation")
 		case awserrors.IsRateLimitedError(err):
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultThrottled, caseLabel.Name: cand.caseLabel})
 			return calls, errs
@@ -749,6 +751,11 @@ func (c *Controller) prune(instances map[string]*instance.Instance) {
 	for id := range c.cases {
 		if _, ok := instances[id]; !ok {
 			delete(c.cases, id)
+		}
+	}
+	for id, b := range c.unauthorized {
+		if c.clk.Since(b.next) > maxBackoff {
+			delete(c.unauthorized, id)
 		}
 	}
 }
