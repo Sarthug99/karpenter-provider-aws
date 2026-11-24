@@ -143,7 +143,6 @@ type pass struct {
 
 type candidate struct {
 	nodeClaim    *karpv1.NodeClaim
-	node         *corev1.Node
 	instance     *instance.Instance
 	caseLabel    string
 	reservations []string
@@ -481,13 +480,6 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		return nil, nil
 	}
 
-	node, err := nodeclaimutils.NodeForNodeClaim(ctx, c.kubeClient, nc)
-	if err != nil {
-		return nil, client.IgnoreNotFound(nodeclaimutils.IgnoreNodeNotFoundError(nodeclaimutils.IgnoreDuplicateNodeError(err)))
-	}
-	if !node.DeletionTimestamp.IsZero() || lo.ContainsBy(node.Spec.Taints, func(t corev1.Taint) bool { return t.MatchTaint(&karpv1.DisruptedNoScheduleTaint) }) {
-		return nil, nil
-	}
 	nodeClass, err := c.nodeClass(ctx, p, nc)
 	if err != nil || nodeClass == nil {
 		return nil, err
@@ -500,6 +492,13 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		p.ineligible[reasonNoCompatibleCR]++
 		return nil, nil
 	}
+	node, err := nodeclaimutils.NodeForNodeClaim(ctx, c.kubeClient, nc)
+	if err != nil {
+		return nil, client.IgnoreNotFound(nodeclaimutils.IgnoreNodeNotFoundError(nodeclaimutils.IgnoreDuplicateNodeError(err)))
+	}
+	if !node.DeletionTimestamp.IsZero() || lo.ContainsBy(node.Spec.Taints, func(t corev1.Taint) bool { return t.MatchTaint(&karpv1.DisruptedNoScheduleTaint) }) {
+		return nil, nil
+	}
 	reservations, reason, err := c.filterCompatible(ctx, p, nc, []*corev1.Node{node}, reservations)
 	if err != nil {
 		return nil, err
@@ -510,7 +509,7 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		}
 		return nil, nil
 	}
-	return &candidate{nodeClaim: nc, node: node, instance: inst, caseLabel: migrationCase, reservations: reservations, endTimes: endTimes}, nil
+	return &candidate{nodeClaim: nc, instance: inst, caseLabel: migrationCase, reservations: reservations, endTimes: endTimes}, nil
 }
 
 // filterCompatible keeps the reservations whose labels neither the NodePool nor any pod on the nodes rejects, else returns why.
@@ -638,8 +637,7 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 		if len(reservations) == 0 {
 			continue
 		}
-		sort.SliceStable(reservations, func(i, j int) bool { return preferred(reservations[i], reservations[j], cand.endTimes, budgets) })
-		target := reservations[0]
+		target := lo.MinBy(reservations, func(a, b string) bool { return preferred(a, b, cand.endTimes, budgets) })
 		nc, inst := cand.nodeClaim, cand.instance
 		// Record intent first so a crash after the call still leaves durable state for the ledger.
 		if err := c.setTarget(ctx, nc, target); err != nil {
@@ -893,8 +891,8 @@ func (c *Controller) publishGauges(p *pass) {
 		MigrationPending.Set(float64(instances.Len()), map[string]string{reservationIDLabel.Name: id})
 	}
 	MigrationIneligible.Reset()
-	for _, reason := range []string{reasonPreferenceOpen, reasonPodIncompatible, reasonNodePoolIncompatible, reasonNoCapacity, reasonNoCompatibleCR, reasonZonalShift} {
-		MigrationIneligible.Set(float64(p.ineligible[reason]), map[string]string{reasonLabel.Name: reason})
+	for _, reason := range reasonLabel.Values {
+		MigrationIneligible.Set(float64(p.ineligible[reason.Name]), map[string]string{reasonLabel.Name: reason.Name})
 	}
 	MigrationStalled.Set(float64(p.stalled), map[string]string{})
 }
