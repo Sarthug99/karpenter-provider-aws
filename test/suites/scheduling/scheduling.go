@@ -1019,7 +1019,7 @@ func RegisterTests(minValuesPolicy options.MinValuesPolicy) bool {
 					g.Expect(nc.Status.ProviderID).To(Equal(node.Spec.ProviderID))
 					g.Expect(nc.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
 					g.Expect(nc.Labels).To(HaveKeyWithValue(v1.LabelCapacityReservationID, reservationID))
-					g.Expect(nc.Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationTarget))
+					g.Expect(nc.Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationRequestedAt))
 
 					n := &corev1.Node{}
 					g.Expect(Env.Client.Get(Env, client.ObjectKeyFromObject(node), n)).To(Succeed())

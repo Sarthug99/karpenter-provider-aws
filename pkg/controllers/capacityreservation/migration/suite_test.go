@@ -389,7 +389,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			expectReserved(nc, node, "cr-1")
 			nc = ExpectExists(ctx, env.Client, nc)
-			Expect(nc.Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationTarget))
+			Expect(nc.Annotations).To(HaveKeyWithValue(v1.AnnotationCapacityReservationMigrationTarget, "cr-1"))
 			Expect(nc.Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationRequestedAt))
 			Expect(recorder.Calls(migration.EventReasonCompleted)).To(Equal(1))
 			Expect(modifyCalls()).To(Equal(1))
@@ -1200,7 +1200,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			cover(id)
 			ExpectSingletonReconciled(ctx, controller)
 			expectReserved(nc, node, "cr-1")
-			Expect(ExpectExists(ctx, env.Client, nc).Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationTarget))
+			Expect(ExpectExists(ctx, env.Client, nc).Annotations).To(HaveKeyWithValue(v1.AnnotationCapacityReservationMigrationTarget, "cr-1"))
 			Expect(recorder.Calls(migration.EventReasonIncompatible)).To(Equal(1))
 			Expect(recorder.DetectedEvent("Instance is covered by capacity reservation cr-1 and relabeled reserved, but its NodePool no longer allows it; the node may drift or lose pods")).To(BeTrue())
 			Expect(recorder.Calls(migration.EventReasonCompleted)).To(Equal(1))
@@ -1231,6 +1231,35 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			// The slot stays held until EC2's next sync counts the instance.
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
 		})
+		DescribeTable("should relabel a finished migration again after a stale snapshot demotes it",
+			func(gate bool) {
+				gctx := options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacityMigration: lo.ToPtr(gate)}}))
+				finish := func() {
+					if gate {
+						ExpectSingletonReconciled(ctx, controller)
+					} else {
+						ExpectSingletonReconciled(gctx, capacityTypeController)
+					}
+				}
+				nc, node, id := makeNode()
+				ExpectSingletonReconciled(ctx, controller)
+				cover(id)
+				finish()
+				expectReserved(nc, node, "cr-1")
+				// A lagging DescribeInstances briefly shows the instance uncovered.
+				inst := ec2Instance(id)
+				inst.CapacityReservationId = nil
+				awsEnv.EC2API.Instances.Store(id, inst)
+				ExpectSingletonReconciled(gctx, capacityTypeController)
+				expectOnDemand(nc, node)
+				cover(id)
+				finish()
+				expectReserved(nc, node, "cr-1")
+				Expect(modifyCalls()).To(Equal(1))
+			},
+			Entry("by the migration controller", true),
+			Entry("by the capacitytype controller with the gate off", false),
+		)
 		It("should not promote coverage by a reservation the EC2NodeClass doesn't select", func() {
 			nc, node, id := makeNode()
 			ExpectSingletonReconciled(ctx, controller)

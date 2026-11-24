@@ -156,13 +156,14 @@ func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2
 	}
 	stored := nc.DeepCopy()
 	nc.Labels = lo.Assign(nc.Labels, labels)
-	delete(nc.Annotations, v1.AnnotationCapacityReservationMigrationTarget)
+	_, first := nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]
+	// The target stays as a marker, so a demotion from a stale DescribeInstances is promoted again.
 	delete(nc.Annotations, v1.AnnotationCapacityReservationMigrationRequestedAt)
 	if err := c.kubeClient.Patch(ctx, nc, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 		return false, client.IgnoreNotFound(serrors.Wrap(fmt.Errorf("patching nodeclaim, %w", err), "NodeClaim", klog.KObj(nc)))
 	}
 	// EC2's count now includes this instance, but our cache won't until its next sync.
-	if instanceID, err := utils.ParseInstanceID(nc.Status.ProviderID); err == nil {
+	if instanceID, err := utils.ParseInstanceID(nc.Status.ProviderID); err == nil && first {
 		c.crProvider.MarkMigrated(id, instanceID)
 	}
 	return true, nil

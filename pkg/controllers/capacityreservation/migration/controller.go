@@ -194,7 +194,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 			continue
 		}
 		inst, ok := byID[id]
-		target := nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget]
+		target := trackedTarget(nc)
 		// A draining or briefly unlisted instance keeps its EC2 target, so its slot stays held.
 		if !nc.DeletionTimestamp.IsZero() {
 			if ok {
@@ -262,7 +262,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 //nolint:gocyclo
 func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.NodeClaim, inst *instance.Instance) (bool, error) {
 	state := inst.CapacityReservationState
-	target := nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget]
+	target := trackedTarget(nc)
 	if target == "" {
 		// Adopt an instance re-targeted but not yet recorded, e.g. a Modify that timed out client-side but succeeded.
 		if nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand || state.TargetID == "" {
@@ -316,16 +316,28 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 		// The target died while pending; this is now the orphaned case.
 		return true, c.clearTarget(ctx, nc)
 	}
-	if requestedAt, err := time.Parse(time.RFC3339, nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]); err == nil {
-		if pendingFor := c.clk.Since(requestedAt); pendingFor > stallThreshold {
-			// EC2 covers a re-target as soon as a slot is free, so a hold this old only keeps a slot from launches.
-			p.stalled++
-			c.recorder.Publish(stalledEvent(nc, target, pendingFor))
-			return false, nil
-		}
+	requestedAt, err := time.Parse(time.RFC3339, nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt])
+	if err != nil {
+		// Only a completed migration's marker lacks requested-at, and its slot is already in EC2's count.
+		return false, nil
+	}
+	if pendingFor := c.clk.Since(requestedAt); pendingFor > stallThreshold {
+		// EC2 covers a re-target as soon as a slot is free, so a hold this old only keeps a slot from launches.
+		p.stalled++
+		c.recorder.Publish(stalledEvent(nc, target, pendingFor))
+		return false, nil
 	}
 	p.hold(target, inst.ID)
 	return false, nil
+}
+
+// trackedTarget returns the NodeClaim's migration target unless it is a completed migration's marker that still matches its labels.
+func trackedTarget(nc *karpv1.NodeClaim) string {
+	target := nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget]
+	if nc.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved && nc.Labels[cloudprovider.ReservationIDLabel] == target {
+		return ""
+	}
+	return target
 }
 
 // holdUncovered holds a slot for an instance we won't relabel whose live target will still cover it once a slot frees.
@@ -377,10 +389,13 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	}
 	if nodeClass == nil || !adoptable(nodeClass, target) {
 		// Like an open ODCR match, an unselected reservation stays on-demand; adoption relabels it if it is selected again.
+		requestedAt := nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]
 		if err := c.clearTarget(ctx, nc); err != nil {
 			return err
 		}
-		c.crProvider.MarkMigrated(target, inst.ID)
+		if requestedAt != "" {
+			c.crProvider.MarkMigrated(target, inst.ID)
+		}
 		delete(c.cases, inst.ID)
 		c.recorder.Publish(notRelabeledEvent(nc, target, lo.Ternary(nodeClass == nil, "the EC2NodeClass is gone", "the reservation is no longer selected by the EC2NodeClass")))
 		return nil
@@ -407,17 +422,17 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	stored := nc.DeepCopy()
 	nc.Labels = lo.Assign(nc.Labels, labels)
 	requestedAt := nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]
-	delete(nc.Annotations, v1.AnnotationCapacityReservationMigrationTarget)
+	// The target stays as a marker, so a demotion from a stale DescribeInstances is relabeled once coverage shows again.
 	delete(nc.Annotations, v1.AnnotationCapacityReservationMigrationRequestedAt)
 	if err := c.kubeClient.Patch(ctx, nc, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 		return client.IgnoreNotFound(fmt.Errorf("patching nodeclaim, %w", err))
 	}
-	// EC2's count now includes this instance, but our cache won't until its next sync.
-	c.crProvider.MarkMigrated(target, inst.ID)
 	if t, err := time.Parse(time.RFC3339, requestedAt); err == nil {
+		// EC2's count now includes this instance, but our cache won't until its next sync.
+		c.crProvider.MarkMigrated(target, inst.ID)
 		MigrationCoverageDurationSeconds.Observe(c.clk.Since(t).Seconds(), map[string]string{})
+		MigrationCompletedTotal.Inc(map[string]string{caseLabel.Name: lo.ValueOr(c.cases, inst.ID, caseOnDemand)})
 	}
-	MigrationCompletedTotal.Inc(map[string]string{caseLabel.Name: lo.ValueOr(c.cases, inst.ID, caseOnDemand)})
 	delete(c.cases, inst.ID)
 	c.recorder.Publish(completedEvent(nc, target))
 	log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Info("migrated node into capacity reservation")

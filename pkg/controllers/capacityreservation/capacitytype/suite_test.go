@@ -219,7 +219,7 @@ var _ = Describe("Capacity Reservation Capacity Type Controller", func() {
 				Expect(labels).To(HaveKeyWithValue(corecloudprovider.ReservationIDLabel, reservationID))
 				Expect(labels).To(HaveKeyWithValue(v1.LabelCapacityReservationType, string(v1.CapacityReservationTypeDefault)))
 			}
-			Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationTarget))
+			Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(HaveKeyWithValue(v1.AnnotationCapacityReservationMigrationTarget, reservationID))
 			Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationRequestedAt))
 			// EC2's count includes the instance before our cache does.
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(1))

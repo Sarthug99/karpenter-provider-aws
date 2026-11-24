@@ -256,8 +256,8 @@ var (
 		Example: "cr-56fac701cc1951b03",
 		UsedOn:  []runtime.Object{&karpv1.NodeClaim{}},
 		Help: "With the ReservedCapacityMigration feature gate, Karpenter sets this to the capacity reservation it " +
-			"re-targeted the NodeClaim's running instance at, and removes it once EC2 reports the instance covered " +
-			"and the NodeClaim is relabeled reserved.",
+			"re-targeted the NodeClaim's running instance at. It stays once EC2 reports the instance covered and the " +
+			"NodeClaim is relabeled reserved, so a demotion from stale EC2 data is relabeled again.",
 		Stage:        docs.Alpha,
 		InternalOnly: true,
 	}

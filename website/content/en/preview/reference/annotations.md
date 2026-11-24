@@ -95,7 +95,7 @@ Used on: NodeClaim
 
 Stability Level: ALPHA
 
-With the ReservedCapacityMigration feature gate, Karpenter sets this to the capacity reservation it re-targeted the NodeClaim's running instance at, and removes it once EC2 reports the instance covered and the NodeClaim is relabeled reserved.
+With the ReservedCapacityMigration feature gate, Karpenter sets this to the capacity reservation it re-targeted the NodeClaim's running instance at. It stays once EC2 reports the instance covered and the NodeClaim is relabeled reserved, so a demotion from stale EC2 data is relabeled again.
 
 ### `karpenter.k8s.aws/ec2nodeclass-hash`
 
