@@ -38,6 +38,14 @@ var _ = Describe("availabilityCache", func() {
 		c.syncAvailability(map[string]int{"cr-1": 2}, clk.Now())
 		Expect(c.GetAvailableInstanceCount("cr-1")).To(Equal(2))
 	})
+	It("should expire migrated holds for reservations no sync returns", func() {
+		clk := clock.NewFakeClock(time.Now())
+		c := &availabilityCache{availabilityCache: cache.New(time.Hour, time.Minute), clk: clk}
+		c.MarkMigrated("cr-unselected", "i-1")
+		clk.Step(terminatedInstanceTTL + time.Second)
+		c.syncAvailability(map[string]int{"cr-1": 2}, clk.Now())
+		Expect(c.migrated).To(BeEmpty())
+	})
 	It("should drop migrated holds when the count is forced from EC2", func() {
 		clk := clock.NewFakeClock(time.Now())
 		c := &availabilityCache{availabilityCache: cache.New(time.Hour, time.Minute), terminationCache: cache.New(time.Hour, time.Minute), clk: clk}

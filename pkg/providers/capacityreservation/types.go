@@ -143,6 +143,17 @@ func (c *availabilityCache) syncAvailability(availability map[string]int, reques
 			delete(c.migrated, id)
 		}
 	}
+	// Holds for reservations no sync returns, e.g. ones no longer selected, would otherwise never be freed.
+	for id, instances := range c.migrated {
+		for instanceID, coveredAt := range instances {
+			if now.Sub(coveredAt) > terminatedInstanceTTL {
+				delete(instances, instanceID)
+			}
+		}
+		if len(instances) == 0 {
+			delete(c.migrated, id)
+		}
+	}
 }
 
 func (c *availabilityCache) SetPendingMigrations(pending map[string]sets.Set[string]) {
