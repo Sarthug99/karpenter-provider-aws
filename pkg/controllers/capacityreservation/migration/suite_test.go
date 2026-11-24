@@ -191,16 +191,7 @@ func reservation(id string, available int32, mutate ...func(*ec2types.CapacityRe
 }
 
 func statusFor(cr ec2types.CapacityReservation) v1.CapacityReservation {
-	return v1.CapacityReservation{
-		ID:                    *cr.CapacityReservationId,
-		AvailabilityZone:      *cr.AvailabilityZone,
-		InstanceType:          *cr.InstanceType,
-		OwnerID:               *cr.OwnerId,
-		InstanceMatchCriteria: string(cr.InstanceMatchCriteria),
-		ReservationType:       lo.Ternary(cr.ReservationType == ec2types.CapacityReservationTypeCapacityBlock, v1.CapacityReservationTypeCapacityBlock, v1.CapacityReservationTypeDefault),
-		Interruptible:         lo.FromPtr(cr.Interruptible),
-		State:                 v1.CapacityReservationStateActive,
-	}
+	return lo.Must(v1.CapacityReservationFromEC2(awsEnv.Clock, &cr))
 }
 
 var _ = Describe("Capacity Reservation Migration Controller", func() {
@@ -700,7 +691,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			awsEnv.ARCZonalShiftAPI.GetManagedResourceBehavior.Output.Set(&arczonalshift.GetManagedResourceOutput{
 				ZonalShifts: []arczonalshifttypes.ZonalShiftInResource{{
 					AwayFrom:      lo.ToPtr("tstz1-1a"),
-					ExpiryTime:    lo.ToPtr(time.Now().Add(time.Hour)),
+					ExpiryTime:    lo.ToPtr(awsEnv.Clock.Now().Add(time.Hour)),
 					AppliedStatus: arczonalshifttypes.AppliedStatusApplied,
 				}},
 			})
