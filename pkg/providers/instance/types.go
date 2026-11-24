@@ -113,9 +113,14 @@ func capacityTypeFromInstance(ctx context.Context, instance ec2types.Instance) s
 	if instance.SpotInstanceRequestId != nil {
 		return karpv1.CapacityTypeSpot
 	}
-	if karpopts.FromContext(ctx).FeatureGates.ReservedCapacity &&
-		instance.CapacityReservationId != nil &&
-		instance.CapacityReservationSpecification.CapacityReservationPreference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly {
+	if !karpopts.FromContext(ctx).FeatureGates.ReservedCapacity || instance.CapacityReservationId == nil || instance.CapacityReservationSpecification == nil {
+		return karpv1.CapacityTypeOnDemand
+	}
+	if instance.CapacityReservationSpecification.CapacityReservationPreference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly {
+		return karpv1.CapacityTypeReserved
+	}
+	// Migrated in place by a newer Karpenter: covered by its own target, so it stays reserved after a rollback.
+	if target := instance.CapacityReservationSpecification.CapacityReservationTarget; target != nil && lo.FromPtr(target.CapacityReservationId) == *instance.CapacityReservationId {
 		return karpv1.CapacityTypeReserved
 	}
 	return karpv1.CapacityTypeOnDemand
