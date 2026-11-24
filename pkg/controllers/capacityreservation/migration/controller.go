@@ -130,6 +130,7 @@ type pass struct {
 	raw         map[string]map[string]*ec2types.CapacityReservation // nodeclass name -> reservation id -> reservation
 	active      map[string]bool
 	pending     map[string]sets.Set[string]
+	launching   map[string]int // reservation ID -> reserved NodeClaims not yet launched
 	ineligible  map[string]int
 	stalled     int
 }
@@ -161,6 +162,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		raw:         map[string]map[string]*ec2types.CapacityReservation{},
 		active:      map[string]bool{},
 		pending:     map[string]sets.Set[string]{},
+		launching:   map[string]int{},
 		ineligible:  map[string]int{},
 	}
 	c.prune(byID)
@@ -170,6 +172,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	for _, nc := range nodeClaims {
 		id, err := utils.ParseInstanceID(nc.Status.ProviderID)
 		if err != nil {
+			p.holdLaunch(nc)
 			continue
 		}
 		inst, ok := byID[id]
@@ -596,7 +599,9 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			break
 		}
 		// The ledger-adjusted count already excludes slots claimed earlier in this pass.
-		budgets := lo.SliceToMap(cand.reservations, func(id string) (string, int) { return id, c.crProvider.GetAvailableInstanceCount(id) })
+		budgets := lo.SliceToMap(cand.reservations, func(id string) (string, int) {
+			return id, c.crProvider.GetAvailableInstanceCount(id) - p.launching[id]
+		})
 		reservations := lo.Filter(cand.reservations, func(id string, _ int) bool { return budgets[id] > 0 })
 		if len(reservations) == 0 {
 			p.ineligible[reasonNoCapacity]++
@@ -675,6 +680,22 @@ func ambiguous(err error) bool {
 		return true
 	}
 	return serverErrorCodes.Has(apiErr.ErrorCode())
+}
+
+// holdLaunch keeps migration off slots the scheduler gave an un-launched NodeClaim; Create only counts it once launched.
+func (p *pass) holdLaunch(nc *karpv1.NodeClaim) {
+	if !nc.DeletionTimestamp.IsZero() {
+		return
+	}
+	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nc.Spec.Requirements...)
+	if !reqs.Has(karpv1.CapacityTypeLabelKey) || !reqs.Has(cloudprovider.ReservationIDLabel) ||
+		!reqs.Get(karpv1.CapacityTypeLabelKey).Has(karpv1.CapacityTypeReserved) || reqs.Get(karpv1.CapacityTypeLabelKey).Len() != 1 {
+		return
+	}
+	// The launch may land in any of the offered reservations, so hold one slot in each.
+	for _, id := range reqs.Get(cloudprovider.ReservationIDLabel).Values() {
+		p.launching[id]++
+	}
 }
 
 func (p *pass) hold(target, instanceID string) {

@@ -474,6 +474,42 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(modifyCalls()).To(Equal(2))
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(0))
 		})
+		Context("Un-launched reserved NodeClaims", func() {
+			var pending *karpv1.NodeClaim
+			BeforeEach(func() {
+				cr := reservation("cr-1", 2)
+				setReservations([]ec2types.CapacityReservation{cr}, cr)
+				pending = coretest.NodeClaim(karpv1.NodeClaim{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{karpv1.NodePoolLabelKey: nodePool.Name}},
+					Spec: karpv1.NodeClaimSpec{
+						NodeClassRef: &karpv1.NodeClassReference{Group: object.GVK(nodeClass).Group, Kind: object.GVK(nodeClass).Kind, Name: nodeClass.Name},
+						Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
+							{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeReserved}},
+							{Key: corecloudprovider.ReservationIDLabel, Operator: corev1.NodeSelectorOpIn, Values: []string{"cr-1"}},
+						},
+					},
+				})
+				pending.Status.ProviderID = ""
+				ExpectApplied(ctx, env.Client, pending)
+			})
+			It("should hold a slot for a reserved NodeClaim that hasn't launched", func() {
+				makeNode()
+				makeNode()
+				ExpectSingletonReconciled(ctx, controller)
+				Expect(modifyCalls()).To(Equal(1))
+				ExpectMetricGaugeValue(migration.MigrationIneligible, 1, map[string]string{"reason": "no_capacity"})
+			})
+			It("should stop holding once the NodeClaim launches, without double counting", func() {
+				_, err := awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-1"})
+				Expect(err).ToNot(HaveOccurred())
+				pending.Status.ProviderID = fmt.Sprintf("aws:///%s/%s", zone, fake.InstanceID())
+				ExpectApplied(ctx, env.Client, pending)
+				awsEnv.CapacityReservationProvider.MarkLaunched("cr-1")
+				makeNode()
+				ExpectSingletonReconciled(ctx, controller)
+				Expect(modifyCalls()).To(Equal(1))
+			})
+		})
 		It("should make at most 10 Modify calls per pass", func() {
 			cr := reservation("cr-1", 20)
 			setReservations([]ec2types.CapacityReservation{cr}, cr)
