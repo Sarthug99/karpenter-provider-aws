@@ -168,7 +168,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	c.prune(byID)
 
 	var errs []error
-	var unclaimed []*karpv1.NodeClaim
+	var unclaimed []*candidate
 	for _, nc := range nodeClaims {
 		id, err := utils.ParseInstanceID(nc.Status.ProviderID)
 		if err != nil {
@@ -197,15 +197,15 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 			continue
 		}
 		if free {
-			unclaimed = append(unclaimed, nc)
+			unclaimed = append(unclaimed, &candidate{nodeClaim: nc, instance: inst})
 		}
 	}
 	// Publish the ledger before selection so the scheduler and our budget both see in-flight migrations.
 	c.crProvider.SetPendingMigrations(p.pending)
 
 	var candidates []*candidate
-	for _, nc := range unclaimed {
-		cand, err := c.eligible(ctx, p, nc, byID)
+	for _, u := range unclaimed {
+		cand, err := c.eligible(ctx, p, u.nodeClaim, u.instance)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -257,7 +257,7 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 			return false, err
 		}
 		if !ok {
-			return true, c.holdUncovered(ctx, p, inst)
+			return true, c.holdUncovered(ctx, p, nc, inst)
 		}
 		if err := c.setTarget(ctx, nc, state.TargetID); err != nil {
 			return false, err
@@ -279,7 +279,7 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 			return false, err
 		}
 		if !ok {
-			return true, multierr.Combine(c.holdUncovered(ctx, p, inst), c.clearTarget(ctx, nc))
+			return true, multierr.Combine(c.holdUncovered(ctx, p, nc, inst), c.clearTarget(ctx, nc))
 		}
 		if err := c.setTarget(ctx, nc, state.TargetID); err != nil {
 			return false, err
@@ -289,7 +289,7 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 	if state.CoveringID == target {
 		return false, c.complete(ctx, p, nc, inst, target)
 	}
-	active, err := c.isActive(ctx, p, target)
+	active, err := c.isActive(ctx, p, nc, target)
 	if err != nil {
 		return false, err
 	}
@@ -308,12 +308,12 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 }
 
 // holdUncovered holds a slot for an instance we won't relabel whose live target will still cover it once a slot frees.
-func (c *Controller) holdUncovered(ctx context.Context, p *pass, inst *instance.Instance) error {
+func (c *Controller) holdUncovered(ctx context.Context, p *pass, nc *karpv1.NodeClaim, inst *instance.Instance) error {
 	state := inst.CapacityReservationState
 	if state.TargetID == "" || state.CoveringID != "" {
 		return nil
 	}
-	active, err := c.isActive(ctx, p, state.TargetID)
+	active, err := c.isActive(ctx, p, nc, state.TargetID)
 	if active {
 		p.hold(state.TargetID, inst.ID)
 	}
@@ -331,7 +331,7 @@ func (c *Controller) relabelable(ctx context.Context, p *pass, nc *karpv1.NodeCl
 	if err != nil || nodeClass == nil || !adoptable(nodeClass, id) {
 		return false, err
 	}
-	if active, err := c.isActive(ctx, p, id); err != nil || !active {
+	if active, err := c.isActive(ctx, p, nc, id); err != nil || !active {
 		return false, err
 	}
 	nodes, err := nodeclaimutils.AllNodesForNodeClaim(ctx, c.kubeClient, nc)
@@ -420,7 +420,7 @@ func reservedLabels(reservationID string) map[string]string {
 // eligible returns the NodeClaim as a migration candidate with its compatible reservations, or nil if it can't move.
 //
 //nolint:gocyclo
-func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim, byID map[string]*instance.Instance) (*candidate, error) {
+func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim, inst *instance.Instance) (*candidate, error) {
 	if nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand {
 		return nil, nil
 	}
@@ -429,9 +429,7 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		!nc.StatusConditions().Get(karpv1.ConditionTypeInitialized).IsTrue() {
 		return nil, nil
 	}
-	id := lo.Must(utils.ParseInstanceID(nc.Status.ProviderID))
-	inst := byID[id]
-	if b, ok := c.backoff[id]; ok && c.clk.Now().Before(b.next) {
+	if b, ok := c.backoff[inst.ID]; ok && c.clk.Now().Before(b.next) {
 		return nil, nil
 	}
 	state := inst.CapacityReservationState
@@ -450,7 +448,7 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	case state.TargetID == "" && state.Preference == ec2types.CapacityReservationPreferenceNone:
 		migrationCase = caseOnDemand
 	case state.TargetID != "":
-		active, err := c.isActive(ctx, p, state.TargetID)
+		active, err := c.isActive(ctx, p, nc, state.TargetID)
 		if err != nil {
 			return nil, err
 		}
@@ -538,14 +536,9 @@ func (c *Controller) filterCompatible(ctx context.Context, p *pass, nc *karpv1.N
 //
 //nolint:gocyclo
 func (c *Controller) compatibleReservations(ctx context.Context, p *pass, nodeClass *v1.EC2NodeClass, inst *instance.Instance, source string) ([]string, map[string]time.Time, error) {
-	raw, ok := p.raw[nodeClass.Name]
-	if !ok {
-		reservations, err := c.crProvider.List(ctx, nodeClass.Spec.CapacityReservationSelectorTerms...)
-		if err != nil {
-			return nil, nil, fmt.Errorf("listing capacity reservations, %w", err)
-		}
-		raw = lo.KeyBy(reservations, func(r *ec2types.CapacityReservation) string { return lo.FromPtr(r.CapacityReservationId) })
-		p.raw[nodeClass.Name] = raw
+	raw, err := c.selected(ctx, p, nodeClass)
+	if err != nil {
+		return nil, nil, err
 	}
 	// An unknown platform could pick a reservation EC2 won't match, and the move can't be undone.
 	if inst.CapacityReservationState.Platform == "" {
@@ -573,6 +566,20 @@ func (c *Controller) compatibleReservations(ctx context.Context, p *pass, nodeCl
 		return cr.ID, true
 	})
 	return ids, endTimes, nil
+}
+
+// selected returns the active reservations the NodeClass's selector terms match, keyed by ID.
+func (c *Controller) selected(ctx context.Context, p *pass, nodeClass *v1.EC2NodeClass) (map[string]*ec2types.CapacityReservation, error) {
+	if raw, ok := p.raw[nodeClass.Name]; ok {
+		return raw, nil
+	}
+	reservations, err := c.crProvider.List(ctx, nodeClass.Spec.CapacityReservationSelectorTerms...)
+	if err != nil {
+		return nil, fmt.Errorf("listing capacity reservations, %w", err)
+	}
+	raw := lo.KeyBy(reservations, func(r *ec2types.CapacityReservation) string { return lo.FromPtr(r.CapacityReservationId) })
+	p.raw[nodeClass.Name] = raw
+	return raw, nil
 }
 
 // preferred orders reservations that never end first, then by latest end, then by most free slots, then by ID.
@@ -671,6 +678,7 @@ func ambiguous(err error) bool {
 	}
 	apiErr, ok := lo.ErrorsAs[smithy.APIError](err)
 	if !ok {
+		// A transport error (timeout, reset, canceled context) carries no EC2 verdict, so the call may have landed.
 		return true
 	}
 	if resp, ok := lo.ErrorsAs[interface {
@@ -753,9 +761,24 @@ func (c *Controller) clearTarget(ctx context.Context, nc *karpv1.NodeClaim) erro
 }
 
 // isActive reports whether a reservation is still active; List returns active, unexpired reservations only.
-func (c *Controller) isActive(ctx context.Context, p *pass, id string) (bool, error) {
+func (c *Controller) isActive(ctx context.Context, p *pass, nc *karpv1.NodeClaim, id string) (bool, error) {
 	if active, ok := p.active[id]; ok {
 		return active, nil
+	}
+	// The NodeClass's selector query is usually cached, so check it before a by-ID call.
+	nodeClass, err := c.nodeClass(ctx, p, nc)
+	if err != nil {
+		return false, err
+	}
+	if nodeClass != nil {
+		raw, err := c.selected(ctx, p, nodeClass)
+		if err != nil {
+			return false, err
+		}
+		if _, ok := raw[id]; ok {
+			p.active[id] = true
+			return true, nil
+		}
 	}
 	reservations, err := c.crProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: id})
 	if err != nil {
