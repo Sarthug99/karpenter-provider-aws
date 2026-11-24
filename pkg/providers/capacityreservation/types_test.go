@@ -38,4 +38,14 @@ var _ = Describe("availabilityCache", func() {
 		c.syncAvailability(map[string]int{"cr-1": 2}, clk.Now())
 		Expect(c.GetAvailableInstanceCount("cr-1")).To(Equal(2))
 	})
+	It("should drop migrated holds when the count is forced from EC2", func() {
+		clk := clock.NewFakeClock(time.Now())
+		c := &availabilityCache{availabilityCache: cache.New(time.Hour, time.Minute), terminationCache: cache.New(time.Hour, time.Minute), clk: clk}
+		c.syncAvailability(map[string]int{"cr-1": 2}, clk.Now())
+		c.MarkMigrated("cr-1", "i-1")
+		// A launch hit ReservationCapacityExceeded, then a reserved node terminated.
+		c.SetAvailableInstanceCount("cr-1", 0)
+		c.MarkTerminated("cr-1", "i-2")
+		Expect(c.GetAvailableInstanceCount("cr-1")).To(Equal(1))
+	})
 })

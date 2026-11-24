@@ -240,6 +240,8 @@ func (c *availabilityCache) GetAvailableInstanceCount(reservationID string) int 
 func (c *availabilityCache) SetAvailableInstanceCount(reservationID string, count int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// The forced count is EC2's current verdict, which already includes covered instances.
+	delete(c.migrated, reservationID)
 	c.availabilityCache.SetDefault(reservationID, &availabilityCacheEntry{
 		count:    count,
 		syncTime: c.clk.Now(),
