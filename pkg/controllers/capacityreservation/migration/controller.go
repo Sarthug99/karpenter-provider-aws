@@ -254,8 +254,8 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 //nolint:gocyclo
 func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.NodeClaim, inst *instance.Instance) (bool, error) {
 	state := inst.CapacityReservationState
-	target, tracked := nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget]
-	if !tracked {
+	target := nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget]
+	if target == "" {
 		// Adopt an instance re-targeted but not yet recorded, e.g. a Modify that timed out client-side but succeeded.
 		if nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand || state.TargetID == "" {
 			return true, nil

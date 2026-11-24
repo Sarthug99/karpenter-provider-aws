@@ -931,6 +931,16 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(modifyCalls()).To(Equal(1))
 			Expect(ExpectExists(ctx, env.Client, nc).Annotations).To(HaveKeyWithValue(v1.AnnotationCapacityReservationMigrationTarget, "cr-1"))
 		})
+		It("should treat an empty annotation as untracked", func() {
+			setReservations([]ec2types.CapacityReservation{cr}, cr)
+			nc, _, _ := makeNode(nodeOpts{nodeClaim: func(nc *karpv1.NodeClaim) {
+				nc.Annotations = map[string]string{v1.AnnotationCapacityReservationMigrationTarget: ""}
+			}})
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(1))
+			Expect(recorder.Calls(migration.EventReasonNotRelabeled)).To(Equal(0))
+			Expect(ExpectExists(ctx, env.Client, nc).Annotations).To(HaveKeyWithValue(v1.AnnotationCapacityReservationMigrationTarget, "cr-1"))
+		})
 		It("should follow the instance when its target differs from the annotation", func() {
 			other := reservation("cr-2", 2)
 			setReservations([]ec2types.CapacityReservation{cr, other}, cr, other)
