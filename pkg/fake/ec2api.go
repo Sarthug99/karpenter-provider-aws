@@ -77,6 +77,8 @@ type EC2Behavior struct {
 	ModifyInstanceCapacityReservationAttributesBehavior MockedFunction[ec2.ModifyInstanceCapacityReservationAttributesInput, ec2.ModifyInstanceCapacityReservationAttributesOutput]
 	// ModifyInstanceCapacityReservationCoverage makes the fake Modify also set CapacityReservationId (no coverage lag).
 	ModifyInstanceCapacityReservationCoverage stdatomic.Bool
+	// ModifyInstanceCapacityReservationRetryMaxAttempts is the RetryMaxAttempts the last Modify call's options set.
+	ModifyInstanceCapacityReservationRetryMaxAttempts stdatomic.Int32
 
 	Subnets                               sync.Map
 	LaunchTemplates                       sync.Map
@@ -112,6 +114,7 @@ func (e *EC2API) Reset() {
 	e.RebootInstancesBehavior.Reset()
 	e.ModifyInstanceCapacityReservationAttributesBehavior.Reset()
 	e.ModifyInstanceCapacityReservationCoverage.Store(false)
+	e.ModifyInstanceCapacityReservationRetryMaxAttempts.Store(0)
 	e.DescribeInstancesBehavior.Reset()
 	e.CreateLaunchTemplateBehavior.Reset()
 	e.CalledWithDescribeImagesInput.Reset()
@@ -287,7 +290,12 @@ func (e *EC2API) RebootInstances(_ context.Context, input *ec2.RebootInstancesIn
 	})
 }
 
-func (e *EC2API) ModifyInstanceCapacityReservationAttributes(_ context.Context, input *ec2.ModifyInstanceCapacityReservationAttributesInput, _ ...func(*ec2.Options)) (*ec2.ModifyInstanceCapacityReservationAttributesOutput, error) {
+func (e *EC2API) ModifyInstanceCapacityReservationAttributes(_ context.Context, input *ec2.ModifyInstanceCapacityReservationAttributesInput, optFns ...func(*ec2.Options)) (*ec2.ModifyInstanceCapacityReservationAttributesOutput, error) {
+	opts := ec2.Options{}
+	for _, fn := range optFns {
+		fn(&opts)
+	}
+	e.ModifyInstanceCapacityReservationRetryMaxAttempts.Store(int32(opts.RetryMaxAttempts))
 	return e.ModifyInstanceCapacityReservationAttributesBehavior.Invoke(input, func(input *ec2.ModifyInstanceCapacityReservationAttributesInput) (*ec2.ModifyInstanceCapacityReservationAttributesOutput, error) {
 		raw, ok := e.Instances.Load(lo.FromPtr(input.InstanceId))
 		if !ok {

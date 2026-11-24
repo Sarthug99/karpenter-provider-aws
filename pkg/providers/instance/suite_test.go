@@ -1173,6 +1173,13 @@ var _ = Describe("InstanceProvider", func() {
 		)
 	})
 	Context("ModifyCapacityReservationTarget", func() {
+		It("should disable SDK retries for the non-idempotent call", func() {
+			ec2Instance := test.EC2Instance(ec2types.Instance{Placement: &ec2types.Placement{AvailabilityZone: aws.String("test-zone-1a")}})
+			awsEnv.EC2API.Instances.Store(aws.ToString(ec2Instance.InstanceId), ec2Instance)
+			Expect(awsEnv.InstanceProvider.ModifyCapacityReservationTarget(ctx, aws.ToString(ec2Instance.InstanceId), "cr-1")).To(Succeed())
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Calls()).To(Equal(1))
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationRetryMaxAttempts.Load()).To(BeEquivalentTo(1))
+		})
 		It("should report a missing instance as not attempted", func() {
 			err := awsEnv.InstanceProvider.ModifyCapacityReservationTarget(ctx, fake.InstanceID(), "cr-1")
 			Expect(errors.Is(err, instance.ErrModifyNotAttempted)).To(BeTrue())
