@@ -343,6 +343,8 @@ func (c *Controller) relabelable(ctx context.Context, p *pass, nc *karpv1.NodeCl
 }
 
 // complete relabels a covered node reserved. The Nodes go first so a failed NodeClaim patch retries both.
+//
+//nolint:gocyclo
 func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim, inst *instance.Instance, target string) error {
 	nodes, err := nodeclaimutils.AllNodesForNodeClaim(ctx, c.kubeClient, nc)
 	if err != nil {

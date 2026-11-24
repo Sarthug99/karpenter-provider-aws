@@ -89,17 +89,11 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		if !ok {
 			continue
 		}
-		if cpNC.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved {
-			updated, err := c.promote(ctx, nodeClasses, cpNC, &ncs.Items[i])
-			if err != nil {
-				errs = append(errs, err)
-			}
-			if updated {
-				updatedNodeClaims.Insert(ncs.Items[i].Name)
-			}
-			continue
-		}
-		updated, err := c.syncCapacityType(ctx, cpNC.Labels[karpv1.CapacityTypeLabelKey], &ncs.Items[i])
+		updated, err := lo.Ternary(cpNC.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved,
+			func() (bool, error) { return c.promote(ctx, nodeClasses, cpNC, &ncs.Items[i]) },
+			func() (bool, error) {
+				return c.syncCapacityType(ctx, cpNC.Labels[karpv1.CapacityTypeLabelKey], &ncs.Items[i])
+			})()
 		if err != nil {
 			errs = append(errs, err)
 		}
