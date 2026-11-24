@@ -136,13 +136,13 @@ Karpenter considers two kinds of nodes:
 
 A node is moved only when all of the following hold:
 - its NodePool requirements allow `karpenter.sh/capacity-type: reserved` and the reservation's labels
-- every pod on it, including DaemonSet pods and excluding static pods, can run on a reserved node in that reservation. Only required node affinity and `nodeSelector` are checked; preferred affinity doesn't block a move.
+- every pod on it, including DaemonSet pods and excluding static pods, can run on a reserved node in that reservation. Only required node affinity and `nodeSelector` are checked; preferred affinity doesn't block a move. Topology spread constraints and pod (anti-)affinity keyed on `karpenter.sh/capacity-type` or `karpenter.k8s.aws/capacity-reservation-id` aren't checked, so a move can break them.
 - the reservation is in the EC2NodeClass's `status.capacityReservations`, is a `default` (not capacity block or interruptible) reservation, matches the node's instance type, zone, platform and tenancy, isn't in a placement group or on an Outpost, and has a free slot
 
 Karpenter skips nodes in an availability zone that is zonally shifted away from, and reservations that end within an hour.
 Slots already promised to reserved NodeClaims that haven't launched yet aren't used.
 
-Karpenter re-targets the instance and keeps the node labeled `on-demand` until EC2 reports it covered by the reservation. Coverage is usually reported within seconds.
+Karpenter re-targets the instance and keeps the node labeled `on-demand` until EC2 reports it covered by the reservation. Coverage is usually reported within seconds. If it isn't reported within 30 minutes, Karpenter emits a `CapacityReservationMigrationStalled` event and stops holding the reservation's slot for the node.
 It then labels the NodeClaim and Node `reserved`, with `karpenter.k8s.aws/capacity-reservation-id`, `karpenter.k8s.aws/capacity-reservation-type: default` and `karpenter.k8s.aws/capacity-reservation-interruptible: false`.
 No node is drained or replaced.
 Labels follow what EC2 reports: once the instance is covered, Karpenter labels it `reserved` even if the NodePool or a pod stopped allowing that while the move was pending, and emits a `CapacityReservationMigrationIncompatible` warning event.

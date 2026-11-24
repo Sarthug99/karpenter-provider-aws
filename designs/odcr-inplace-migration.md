@@ -20,7 +20,7 @@ The only remedy was consolidation (terminate and relaunch). do-not-disrupt, long
 **Goals**
 - Fill free ODCR slots with existing nodes, with no disruption.
 - Keep the `reserved` label honest: a node is labeled reserved only once EC2 reports coverage.
-- Never violate NodePool requirements or pod constraints.
+- Never violate NodePool requirements or pods' required node affinity. Topology spread and pod (anti-)affinity keyed on capacity-type or reservation-id aren't checked.
 
 **Non-goals**
 - Moving a node between two live ODCRs, or back to `none`. EC2 doesn't support this for running instances.
@@ -72,11 +72,11 @@ sequenceDiagram
 
 ## Design Details
 
-- **State:** two annotations, `karpenter.k8s.aws/capacity-reservation-migration-target` and `-requested-at`. They make the controller restart-safe. EC2's view of the instance is the source of truth.
-- **No double-booking:** pending migrations hold slots in the reservation cache, so neither the provisioner nor a second migration takes them. A covered node stays held until a sync whose API call *started* after coverage. Migration also leaves slots for reserved NodeClaims that haven't launched (one per offered ODCR).
+- **State:** two annotations, `karpenter.k8s.aws/capacity-reservation-migration-target` and `-requested-at`. They make the controller restart-safe. The target stays after completion as a marker, so a demotion from stale EC2 data is relabeled again. EC2's view of the instance is the source of truth.
+- **No double-booking:** pending migrations hold slots in the reservation cache, so neither the provisioner nor a second migration takes them. A covered node stays held until a sync whose API call *started* after coverage, at most 15m, or until the count is forced from EC2 (`SetAvailableInstanceCount`). A pending node stops holding its slot after the 30m stall threshold. Migration also leaves slots for reserved NodeClaims that haven't launched (one per offered ODCR).
 - **Classification and labels:** an instance whose target equals its covering ODCR is `reserved`, independent of the `ReservedCapacityMigration` gate. Labels follow EC2: once covered by a selected ODCR, the node is labeled `reserved` even if a pod or the NodePool started rejecting it while pending (`Incompatible` event; requirement drift handles the NodePool case). If the gate is turned off while a move is pending, the capacitytype controller completes it from the target annotation, so Delete returns the slot to the right ODCR; it never relabels re-targets the migration controller didn't start. Coverage by an unselected ODCR stays `on-demand`, as with open matching, so it can't cause `CapacityReservationDrift`.
 - **Target choice:** ODCRs ending within 1h are skipped (coverage can take up to the 30m stall threshold); then no end date, latest end, most free slots, lowest ID.
-- **Errors:** client errors such as `IncorrectInstanceState` are definite: clear the annotation, back off. `UnauthorizedOperation` backs off that target ODCR (5m doubling to 1h), since a deny may be scoped to one reservation. 5xx, timeouts and resets are ambiguous: keep the hold and reconcile. After a crash between the annotation and the call, the call is re-issued only after a 5m visibility grace. A node that stays pending past 30m gets a `Stalled` event. Instances in a zonally shifted AZ are skipped before annotating.
+- **Errors:** client errors such as `IncorrectInstanceState` or `RequestExpired` are definite: clear the annotation, back off. `UnauthorizedOperation` backs off that instance for that ODCR (5m doubling to 1h), and the whole ODCR for 5m once a second instance is denied, since the shipped policy scopes the permission by instance tags. 5xx, timeouts and resets are ambiguous: keep the annotation and hold, back off, and end the pass. After a crash between the annotation and the call, the call is re-issued only after a 5m visibility grace. A node that stays pending past 30m gets a `Stalled` event and releases its hold. Instances in a zonally shifted AZ are skipped before annotating.
 - **IAM:** `ec2:ModifyInstanceCapacityReservationAttributes`, scoped to instances tagged with the cluster and a NodePool. The getting-started CloudFormation template and docs are updated.
 
 ## Customer Experience (gate on)
