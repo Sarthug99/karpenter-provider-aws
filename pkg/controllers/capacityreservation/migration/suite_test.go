@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"testing"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -138,6 +140,21 @@ type deniedTarget struct {
 
 func (d deniedTarget) ModifyCapacityReservationTarget(ctx context.Context, id, target string) error {
 	if target == d.denied {
+		*d.calls++
+		return &smithy.GenericAPIError{Code: "UnauthorizedOperation", Fault: smithy.FaultClient}
+	}
+	return d.Provider.ModifyCapacityReservationTarget(ctx, id, target)
+}
+
+// deniedInstances fails every Modify of some instances as unauthorized, as a deny scoped by instance tags would.
+type deniedInstances struct {
+	instance.Provider
+	denied sets.Set[string]
+	calls  *int
+}
+
+func (d deniedInstances) ModifyCapacityReservationTarget(ctx context.Context, id, target string) error {
+	if d.denied.Has(id) {
 		*d.calls++
 		return &smithy.GenericAPIError{Code: "UnauthorizedOperation", Fault: smithy.FaultClient}
 	}
@@ -276,6 +293,19 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 		awsEnv.EC2API.Instances.Store(id, inst)
 	}
 	modifyCalls := func() int { return awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Calls() }
+	// migrationOrder returns instance IDs in the order the controller tries on-demand nodes: oldest, then by name.
+	migrationOrder := func() []string {
+		ncs := &karpv1.NodeClaimList{}
+		Expect(env.Client.List(ctx, ncs)).To(Succeed())
+		sort.SliceStable(ncs.Items, func(i, j int) bool {
+			ti, tj := ncs.Items[i].CreationTimestamp, ncs.Items[j].CreationTimestamp
+			if !ti.Equal(&tj) {
+				return ti.Before(&tj)
+			}
+			return ncs.Items[i].Name < ncs.Items[j].Name
+		})
+		return lo.Map(ncs.Items, func(nc karpv1.NodeClaim, _ int) string { return lo.Must(utils.ParseInstanceID(nc.Status.ProviderID)) })
+	}
 	expectOnDemand := func(nc *karpv1.NodeClaim, node *corev1.Node) {
 		GinkgoHelper()
 		nc = ExpectExists(ctx, env.Client, nc)
@@ -1324,45 +1354,55 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(2))
 		})
-		It("should back off a reservation, exponentially, while unauthorized", func() {
-			makeNode()
-			makeNode()
+		It("should back off a reservation once two instances are denied", func() {
+			for range 3 {
+				makeNode()
+			}
 			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "UnauthorizedOperation", Fault: smithy.FaultClient}, fake.MaxCalls(2))
 			ExpectSingletonReconciled(ctx, controller)
-			Expect(modifyCalls()).To(Equal(1))
-			ExpectMetricCounterValue(migration.MigrationAttemptsTotal, 1, map[string]string{"result": "unauthorized", "case": "on_demand"})
-			ExpectSingletonReconciled(ctx, controller)
-			Expect(modifyCalls()).To(Equal(1))
-			awsEnv.Clock.Step(6 * time.Minute)
-			ExpectSingletonReconciled(ctx, controller)
 			Expect(modifyCalls()).To(Equal(2))
-			// The second failure doubles the delay to 10 minutes.
-			awsEnv.Clock.Step(6 * time.Minute)
+			ExpectMetricCounterValue(migration.MigrationAttemptsTotal, 2, map[string]string{"result": "unauthorized", "case": "on_demand"})
+			awsEnv.Clock.Step(time.Minute)
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(modifyCalls()).To(Equal(2))
 			awsEnv.Clock.Step(5 * time.Minute)
 			ExpectSingletonReconciled(ctx, controller)
-			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(2))
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(3))
 		})
-		It("should keep using other reservations while one is unauthorized", func() {
-			denied, allowed := reservation("cr-denied", 5), reservation("cr-allowed", 2)
-			setReservations([]ec2types.CapacityReservation{denied, allowed}, denied, allowed)
-			makeNode()
-			makeNode()
-			deniedCalls := 0
-			c := migration.NewController(awsEnv.Clock, env.Client, cloudProvider, deniedTarget{awsEnv.InstanceProvider, "cr-denied", &deniedCalls}, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
+		It("should keep migrating other instances into a reservation one instance is denied", func() {
+			nodes := lo.Times(3, func(int) string { _, _, id := makeNode(); return id })
+			order := migrationOrder()
+			Expect(order).To(ConsistOf(nodes))
+			calls := 0
+			c := migration.NewController(awsEnv.Clock, env.Client, cloudProvider, deniedInstances{awsEnv.InstanceProvider, sets.New(order[0]), &calls}, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
 			ExpectSingletonReconciled(ctx, c)
-			Expect(deniedCalls).To(Equal(1))
-			Expect(modifyCalls()).To(Equal(1))
+			Expect(calls).To(Equal(1))
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(2))
+			Expect(ec2Instance(order[1]).CapacityReservationSpecification.CapacityReservationTarget).ToNot(BeNil())
+			Expect(ec2Instance(order[2]).CapacityReservationSpecification.CapacityReservationTarget).ToNot(BeNil())
+			// Only the denied instance backs off.
 			awsEnv.Clock.Step(time.Minute)
 			ExpectSingletonReconciled(ctx, c)
-			Expect(deniedCalls).To(Equal(1))
-			Expect(modifyCalls()).To(Equal(2))
-			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.ForEach(func(in *ec2.ModifyInstanceCapacityReservationAttributesInput) {
-				Expect(*in.CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationId).To(Equal("cr-allowed"))
-			})
+			Expect(calls).To(Equal(1))
+			awsEnv.Clock.Step(5 * time.Minute)
+			ExpectSingletonReconciled(ctx, c)
+			Expect(calls).To(Equal(2))
 		})
-		It("should cap the unauthorized backoff at an hour and reset it after a success", func() {
+		It("should still migrate an allowed instance behind instances that keep being denied", func() {
+			for range 3 {
+				makeNode()
+			}
+			order := migrationOrder()
+			calls := 0
+			c := migration.NewController(awsEnv.Clock, env.Client, cloudProvider, deniedInstances{awsEnv.InstanceProvider, sets.New(order[0], order[1]), &calls}, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
+			for range 15 {
+				ExpectSingletonReconciled(ctx, c)
+				awsEnv.Clock.Step(time.Minute)
+			}
+			Expect(ec2Instance(order[2]).CapacityReservationSpecification.CapacityReservationTarget).ToNot(BeNil())
+			Expect(calls).To(Equal(4))
+		})
+		It("should back off a denied instance exponentially up to an hour", func() {
 			makeNode()
 			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "UnauthorizedOperation", Fault: smithy.FaultClient}, fake.MaxCalls(6))
 			for i, delay := range []time.Duration{5, 10, 20, 40, 60, 60} {

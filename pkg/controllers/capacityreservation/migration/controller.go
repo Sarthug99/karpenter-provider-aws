@@ -95,9 +95,11 @@ type Controller struct {
 	recorder         events.Recorder
 
 	backoff      map[string]backoffEntry
-	cases        map[string]string       // instance ID -> migration case, for metrics only
-	unauthorized map[string]backoffEntry // reservation ID -> backoff, since a deny may be scoped to one reservation
-	covered      sets.Set[slot]          // instances marked migrated in a reservation without completing
+	cases        map[string]string           // instance ID -> migration case, for metrics only
+	denied       map[slot]backoffEntry       // instance in a reservation -> backoff after EC2 denied that move
+	deniedBy     map[string]sets.Set[string] // reservation ID -> instances denied since its last backoff or success
+	unauthorized map[string]time.Time        // reservation ID -> end of its backoff
+	covered      sets.Set[slot]              // instances marked migrated in a reservation without completing
 }
 
 // slot is an instance in a reservation.
@@ -118,7 +120,9 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 		recorder:         recorder,
 		backoff:          map[string]backoffEntry{},
 		cases:            map[string]string{},
-		unauthorized:     map[string]backoffEntry{},
+		denied:           map[slot]backoffEntry{},
+		deniedBy:         map[string]sets.Set[string]{},
+		unauthorized:     map[string]time.Time{},
 		covered:          sets.New[slot](),
 	}
 }
@@ -639,12 +643,14 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			p.ineligible[reasonNoCapacity]++
 			continue
 		}
-		reservations = lo.Reject(reservations, func(id string, _ int) bool { return c.clk.Now().Before(c.unauthorized[id].next) })
+		nc, inst := cand.nodeClaim, cand.instance
+		reservations = lo.Reject(reservations, func(id string, _ int) bool {
+			return c.clk.Now().Before(c.unauthorized[id]) || c.clk.Now().Before(c.denied[slot{instanceID: inst.ID, reservationID: id}].next)
+		})
 		if len(reservations) == 0 {
 			continue
 		}
 		target := lo.MinBy(reservations, func(a, b string) bool { return preferred(a, b, cand.endTimes, budgets) })
-		nc, inst := cand.nodeClaim, cand.instance
 		// Record intent first so a crash after the call still leaves durable state for the ledger.
 		if err := c.setTarget(ctx, nc, target); err != nil {
 			errs = append(errs, client.IgnoreNotFound(serrors.Wrap(err, "NodeClaim", klog.KObj(nc))))
@@ -667,6 +673,8 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			p.hold(target, inst.ID)
 			c.crProvider.SetPendingMigrations(p.pending)
 			delete(c.backoff, inst.ID)
+			delete(c.denied, slot{instanceID: inst.ID, reservationID: target})
+			delete(c.deniedBy, target)
 			delete(c.unauthorized, target)
 			c.cases[inst.ID] = cand.caseLabel
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultSuccess, caseLabel.Name: cand.caseLabel})
@@ -692,9 +700,9 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			continue
 		case awserrors.IsUnauthorizedOperationError(err):
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultUnauthorized, caseLabel.Name: cand.caseLabel})
-			c.unauthorized[target] = c.nextBackoff(c.unauthorized[target])
-			log.FromContext(ctx).WithValues("capacity-reservation-id", target, "retry-after", c.unauthorized[target].delay).Error(err,
-				"not authorized for ec2:ModifyInstanceCapacityReservationAttributes, skipping capacity reservation")
+			c.deny(inst.ID, target)
+			log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Error(err,
+				"not authorized for ec2:ModifyInstanceCapacityReservationAttributes, skipping capacity reservation for this instance")
 		case awserrors.IsRateLimitedError(err):
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultThrottled, caseLabel.Name: cand.caseLabel})
 			return calls, errs
@@ -766,6 +774,22 @@ func (p *pass) hold(target, instanceID string) {
 	p.pending[target].Insert(instanceID)
 }
 
+// deny backs off the instance from the reservation, and the whole reservation once a second instance is denied,
+// since the shipped policy scopes the permission by instance tags.
+func (c *Controller) deny(instanceID, reservationID string) {
+	s := slot{instanceID: instanceID, reservationID: reservationID}
+	c.denied[s] = c.nextBackoff(c.denied[s])
+	if c.deniedBy[reservationID] == nil {
+		c.deniedBy[reservationID] = sets.New[string]()
+	}
+	c.deniedBy[reservationID].Insert(instanceID)
+	if c.deniedBy[reservationID].Len() >= 2 {
+		// Fixed, so per-instance backoff outgrows it and repeatedly denied instances stop crowding out the rest.
+		c.unauthorized[reservationID] = c.clk.Now().Add(initialBackoff)
+		delete(c.deniedBy, reservationID)
+	}
+}
+
 func (c *Controller) backOff(instanceID string) {
 	c.backoff[instanceID] = c.nextBackoff(c.backoff[instanceID])
 }
@@ -791,8 +815,23 @@ func (c *Controller) prune(instances map[string]*instance.Instance) {
 			c.covered.Delete(s)
 		}
 	}
-	for id, b := range c.unauthorized {
-		if c.clk.Since(b.next) > maxBackoff {
+	for s, b := range c.denied {
+		if _, ok := instances[s.instanceID]; !ok || c.clk.Since(b.next) > maxBackoff {
+			delete(c.denied, s)
+		}
+	}
+	for id, instanceIDs := range c.deniedBy {
+		for instanceID := range instanceIDs {
+			if _, ok := c.denied[slot{instanceID: instanceID, reservationID: id}]; !ok {
+				instanceIDs.Delete(instanceID)
+			}
+		}
+		if instanceIDs.Len() == 0 {
+			delete(c.deniedBy, id)
+		}
+	}
+	for id, until := range c.unauthorized {
+		if !c.clk.Now().Before(until) {
 			delete(c.unauthorized, id)
 		}
 	}
