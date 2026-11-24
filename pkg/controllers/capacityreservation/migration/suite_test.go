@@ -565,20 +565,24 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 		})
 		Context("Un-launched reserved NodeClaims", func() {
 			var pending *karpv1.NodeClaim
-			BeforeEach(func() {
-				cr := reservation("cr-1", 2)
-				setReservations([]ec2types.CapacityReservation{cr}, cr)
-				pending = coretest.NodeClaim(karpv1.NodeClaim{
+			unlaunched := func(capacityTypes []string, ids ...string) *karpv1.NodeClaim {
+				nc := coretest.NodeClaim(karpv1.NodeClaim{
 					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{karpv1.NodePoolLabelKey: nodePool.Name}},
 					Spec: karpv1.NodeClaimSpec{
 						NodeClassRef: &karpv1.NodeClassReference{Group: object.GVK(nodeClass).Group, Kind: object.GVK(nodeClass).Kind, Name: nodeClass.Name},
 						Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
-							{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeReserved}},
-							{Key: corecloudprovider.ReservationIDLabel, Operator: corev1.NodeSelectorOpIn, Values: []string{"cr-1"}},
+							{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: capacityTypes},
+							{Key: corecloudprovider.ReservationIDLabel, Operator: corev1.NodeSelectorOpIn, Values: ids},
 						},
 					},
 				})
-				pending.Status.ProviderID = ""
+				nc.Status.ProviderID = ""
+				return nc
+			}
+			BeforeEach(func() {
+				cr := reservation("cr-1", 2)
+				setReservations([]ec2types.CapacityReservation{cr}, cr)
+				pending = unlaunched([]string{karpv1.CapacityTypeReserved}, "cr-1")
 				ExpectApplied(ctx, env.Client, pending)
 			})
 			It("should hold a slot for a reserved NodeClaim that hasn't launched", func() {
@@ -586,6 +590,35 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 				makeNode()
 				ExpectSingletonReconciled(ctx, controller)
 				Expect(modifyCalls()).To(Equal(1))
+				ExpectMetricGaugeValue(migration.MigrationIneligible, 1, map[string]string{"reason": "no_capacity"})
+			})
+			It("should not hold a slot for a NodeClaim that may also launch on-demand", func() {
+				ExpectDeleted(ctx, env.Client, pending)
+				ExpectApplied(ctx, env.Client, unlaunched([]string{karpv1.CapacityTypeReserved, karpv1.CapacityTypeOnDemand}, "cr-1"))
+				makeNode()
+				makeNode()
+				ExpectSingletonReconciled(ctx, controller)
+				Expect(modifyCalls()).To(Equal(2))
+			})
+			It("should not hold a slot for a deleting NodeClaim", func() {
+				ExpectDeleted(ctx, env.Client, pending)
+				deleting := unlaunched([]string{karpv1.CapacityTypeReserved}, "cr-1")
+				deleting.Finalizers = []string{karpv1.TerminationFinalizer}
+				ExpectApplied(ctx, env.Client, deleting)
+				Expect(env.Client.Delete(ctx, deleting)).To(Succeed())
+				makeNode()
+				makeNode()
+				ExpectSingletonReconciled(ctx, controller)
+				Expect(modifyCalls()).To(Equal(2))
+			})
+			It("should hold a slot in each reservation the NodeClaim may launch into", func() {
+				a, b := reservation("cr-1", 1), reservation("cr-2", 1)
+				setReservations([]ec2types.CapacityReservation{a, b}, a, b)
+				ExpectDeleted(ctx, env.Client, pending)
+				ExpectApplied(ctx, env.Client, unlaunched([]string{karpv1.CapacityTypeReserved}, "cr-1", "cr-2"))
+				makeNode()
+				ExpectSingletonReconciled(ctx, controller)
+				Expect(modifyCalls()).To(Equal(0))
 				ExpectMetricGaugeValue(migration.MigrationIneligible, 1, map[string]string{"reason": "no_capacity"})
 			})
 			It("should stop holding once the NodeClaim launches, without double counting", func() {
