@@ -161,6 +161,17 @@ func (d deniedInstances) ModifyCapacityReservationTarget(ctx context.Context, id
 	return d.Provider.ModifyCapacityReservationTarget(ctx, id, target)
 }
 
+// countingList counts DescribeInstances sweeps.
+type countingList struct {
+	instance.Provider
+	calls *int
+}
+
+func (l countingList) List(ctx context.Context) ([]*instance.Instance, error) {
+	*l.calls++
+	return l.Provider.List(ctx)
+}
+
 // notAttemptedOnce fails the first Modify before it reaches EC2.
 type notAttemptedOnce struct {
 	instance.Provider
@@ -401,6 +412,33 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(cpNC.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
 			Expect(cpNC.Labels).To(HaveKeyWithValue(corecloudprovider.ReservationIDLabel, "cr-1"))
+		})
+		It("should skip the instance sweep only while no EC2NodeClass selects a reservation and nothing is pending", func() {
+			// EC2NodeClasses outlive ExpectCleanedUp, so drop earlier specs' ones that select reservations.
+			nodeClasses := &v1.EC2NodeClassList{}
+			Expect(env.Client.List(ctx, nodeClasses)).To(Succeed())
+			for i := range nodeClasses.Items {
+				if nodeClasses.Items[i].Name != nodeClass.Name {
+					ExpectDeleted(ctx, env.Client, &nodeClasses.Items[i])
+				}
+			}
+			makeNode()
+			lists := 0
+			c := migration.NewController(awsEnv.Clock, env.Client, cloudProvider, countingList{awsEnv.InstanceProvider, &lists}, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
+			ExpectSingletonReconciled(ctx, c)
+			Expect(lists).To(Equal(0))
+
+			cr := reservation("cr-1", 2)
+			setReservations([]ec2types.CapacityReservation{cr}, cr)
+			ExpectSingletonReconciled(ctx, c)
+			Expect(lists).To(Equal(1))
+			Expect(modifyCalls()).To(Equal(1))
+			// The pending move keeps the sweep, and its hold, after the reservation leaves the status.
+			nodeClass.Status.CapacityReservations = nil
+			ExpectApplied(ctx, env.Client, nodeClass)
+			ExpectSingletonReconciled(ctx, c)
+			Expect(lists).To(Equal(2))
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
 		})
 		It("should hold a covered slot until the next EC2 sync includes it", func() {
 			cr := reservation("cr-1", 2)

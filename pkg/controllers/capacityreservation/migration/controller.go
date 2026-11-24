@@ -167,6 +167,17 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		log.FromContext(ctx).Error(err, "failed listing nodeclaims")
 		return reconciler.Result{RequeueAfter: time.Minute}, nil
 	}
+	idle, err := c.idle(ctx, nodeClaims)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed listing ec2nodeclasses")
+		return reconciler.Result{RequeueAfter: time.Minute}, nil
+	}
+	if idle {
+		// Skip the DescribeInstances sweep, which would find nothing to move or hold.
+		c.crProvider.SetPendingMigrations(nil)
+		c.publishGauges(&pass{})
+		return reconciler.Result{RequeueAfter: time.Minute}, nil
+	}
 	instances, err := c.instanceProvider.List(ctx)
 	if err != nil {
 		log.FromContext(ctx).Error(err, "failed listing instances")
@@ -255,6 +266,18 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{RequeueAfter: conflictRequeue}, nil
 	}
 	return reconciler.Result{RequeueAfter: time.Minute}, nil
+}
+
+// idle reports whether there is nothing to move or hold: no tracked migration and no EC2NodeClass with a reservation.
+func (c *Controller) idle(ctx context.Context, nodeClaims []*karpv1.NodeClaim) (bool, error) {
+	if lo.SomeBy(nodeClaims, func(nc *karpv1.NodeClaim) bool { return trackedTarget(nc) != "" }) {
+		return false, nil
+	}
+	nodeClasses := &v1.EC2NodeClassList{}
+	if err := c.kubeClient.List(ctx, nodeClasses); err != nil {
+		return false, err
+	}
+	return lo.NoneBy(nodeClasses.Items, func(nodeClass v1.EC2NodeClass) bool { return len(nodeClass.Status.CapacityReservations) != 0 }), nil
 }
 
 // reconcileTracked advances a NodeClaim that already has a target, and reports whether it is free for a new migration.
