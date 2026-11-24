@@ -364,7 +364,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(recorder.Calls(migration.EventReasonCompleted)).To(Equal(1))
 			Expect(modifyCalls()).To(Equal(1))
 
-			// The classification change keeps capacitytype from demoting the migrated node.
+			// Target == covering is reserved, so capacitytype doesn't demote it.
 			ExpectSingletonReconciled(ctx, capacityTypeController)
 			expectReserved(nc, node, "cr-1")
 			cpNC, err := cloudProvider.Get(ctx, nc.Status.ProviderID)

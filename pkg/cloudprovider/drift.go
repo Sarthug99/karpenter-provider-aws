@@ -146,7 +146,7 @@ func (c *CloudProvider) isCapacityReservationDrifted(ctx context.Context, nodeCl
 		if i.CapacityReservationDetails == nil || capacityReservationIDs.Has(i.CapacityReservationDetails.ID) {
 			return false
 		}
-		// An in-place re-target Karpenter hasn't labeled reserved stays on-demand to us, as it was before the migration gate.
+		// An in-place re-target Karpenter hasn't labeled reserved counts as on-demand, so it can't drift.
 		return i.CapacityReservationState.Preference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly ||
 			nodeClaim.Labels[cloudprovider.ReservationIDLabel] == i.CapacityReservationDetails.ID
 	}
