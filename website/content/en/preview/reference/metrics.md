@@ -1132,7 +1132,7 @@ Number of ModifyInstanceCapacityReservationAttributes calls made to move a runni
   - `result` — The outcome of the ModifyInstanceCapacityReservationAttributes call.
     - `success` — EC2 accepted the new target.
     - `client_error` — EC2 rejected the request, e.g. the transition or target is not allowed.
-    - `unauthorized` — The controller role lacks ec2:ModifyInstanceCapacityReservationAttributes.
+    - `unauthorized` — EC2 denied ec2:ModifyInstanceCapacityReservationAttributes for the instance or target capacity reservation.
     - `throttled` — EC2 throttled the request.
     - `error` — Any other error.
   - `case` — Why the node is being migrated.

@@ -48,7 +48,7 @@ var (
 		Values: []opmetrics.Value{
 			{Name: resultSuccess, Help: "EC2 accepted the new target."},
 			{Name: resultClientError, Help: "EC2 rejected the request, e.g. the transition or target is not allowed."},
-			{Name: resultUnauthorized, Help: "The controller role lacks ec2:ModifyInstanceCapacityReservationAttributes."},
+			{Name: resultUnauthorized, Help: "EC2 denied ec2:ModifyInstanceCapacityReservationAttributes for the instance or target capacity reservation."},
 			{Name: resultThrottled, Help: "EC2 throttled the request."},
 			{Name: resultError, Help: "Any other error."},
 		},
