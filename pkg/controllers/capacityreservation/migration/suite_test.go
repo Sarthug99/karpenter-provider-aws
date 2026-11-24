@@ -48,6 +48,7 @@ import (
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/capacityreservation/migration"
 	"github.com/aws/karpenter-provider-aws/pkg/fake"
 	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/capacityreservation"
 	"github.com/aws/karpenter-provider-aws/pkg/test"
 	"github.com/aws/karpenter-provider-aws/pkg/utils"
 
@@ -114,6 +115,17 @@ func (c nodeClaimPatchConflict) Patch(ctx context.Context, obj client.Object, pa
 		return apierrors.NewConflict(schema.GroupResource{Group: "karpenter.sh", Resource: "nodeclaims"}, obj.GetName(), errors.New("modified"))
 	}
 	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+// failingList counts capacity reservation queries and fails every one.
+type failingList struct {
+	capacityreservation.Provider
+	calls *int
+}
+
+func (f failingList) List(context.Context, ...v1.CapacityReservationSelectorTerm) ([]*ec2types.CapacityReservation, error) {
+	*f.calls++
+	return nil, &smithy.GenericAPIError{Code: "RequestLimitExceeded"}
 }
 
 // listThenRun runs a hook right after taking the instance snapshot, to interleave a concurrent writer.
@@ -436,6 +448,20 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.RequeueAfter).To(Equal(time.Minute))
 			Expect(modifyCalls()).To(Equal(0))
+		})
+		It("should not repeat a failing reservation query within a pass", func() {
+			cr := reservation("cr-1", 5)
+			setReservations([]ec2types.CapacityReservation{cr}, cr)
+			for range 3 {
+				makeNode()
+			}
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(3))
+			calls := 0
+			c := migration.NewController(awsEnv.Clock, env.Client, cloudProvider, awsEnv.InstanceProvider, failingList{awsEnv.CapacityReservationProvider, &calls}, awsEnv.ZonalShiftProvider, recorder)
+			_, err := c.Reconcile(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(calls).To(Equal(1))
 		})
 		It("should retry soon after a conflict-only pass that made no Modify calls", func() {
 			cr := reservation("cr-1", 2)

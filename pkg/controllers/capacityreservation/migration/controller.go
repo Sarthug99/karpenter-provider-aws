@@ -132,6 +132,7 @@ type pass struct {
 	nodePools   map[string]*karpv1.NodePool
 	raw         map[string]map[string]*ec2types.CapacityReservation // nodeclass name -> reservation id -> reservation
 	active      map[string]bool
+	failed      map[string]error // reservation query -> error, so a failing query isn't repeated within the pass
 	pending     map[string]sets.Set[string]
 	launching   map[string]int // reservation ID -> reserved NodeClaims not yet launched
 	ineligible  map[string]int
@@ -166,6 +167,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		nodePools:   map[string]*karpv1.NodePool{},
 		raw:         map[string]map[string]*ec2types.CapacityReservation{},
 		active:      map[string]bool{},
+		failed:      map[string]error{},
 		pending:     map[string]sets.Set[string]{},
 		launching:   map[string]int{},
 		ineligible:  map[string]int{},
@@ -581,9 +583,14 @@ func (c *Controller) selected(ctx context.Context, p *pass, nodeClass *v1.EC2Nod
 	if raw, ok := p.raw[nodeClass.Name]; ok {
 		return raw, nil
 	}
+	key := "nodeclass/" + nodeClass.Name
+	if err, ok := p.failed[key]; ok {
+		return nil, err
+	}
 	reservations, err := c.crProvider.List(ctx, nodeClass.Spec.CapacityReservationSelectorTerms...)
 	if err != nil {
-		return nil, fmt.Errorf("listing capacity reservations, %w", err)
+		p.failed[key] = fmt.Errorf("listing capacity reservations, %w", err)
+		return nil, p.failed[key]
 	}
 	raw := lo.KeyBy(reservations, func(r *ec2types.CapacityReservation) string { return lo.FromPtr(r.CapacityReservationId) })
 	p.raw[nodeClass.Name] = raw
@@ -788,9 +795,14 @@ func (c *Controller) isActive(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 			return true, nil
 		}
 	}
+	key := "id/" + id
+	if err, ok := p.failed[key]; ok {
+		return false, err
+	}
 	reservations, err := c.crProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: id})
 	if err != nil {
-		return false, fmt.Errorf("getting capacity reservation, %w", err)
+		p.failed[key] = fmt.Errorf("getting capacity reservation, %w", err)
+		return false, p.failed[key]
 	}
 	p.active[id] = lo.ContainsBy(reservations, func(r *ec2types.CapacityReservation) bool { return lo.FromPtr(r.CapacityReservationId) == id })
 	return p.active[id], nil
