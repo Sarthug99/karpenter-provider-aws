@@ -1290,6 +1290,10 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			cover(id)
 			ExpectSingletonReconciled(ctx, controller)
 			expectOnDemand(nc, node)
+			// Covered, so held until EC2's next sync counts it.
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
 		})
 		It("should not adopt when a pod requires on-demand", func() {
 			nc, node, id := makeNode(targeted("cr-1"))

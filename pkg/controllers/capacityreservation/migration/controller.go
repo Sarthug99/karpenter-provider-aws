@@ -387,12 +387,23 @@ func trackedTarget(nc *karpv1.NodeClaim) string {
 // holdUncovered holds a slot for an instance we won't relabel whose live target will still cover it once a slot frees.
 func (c *Controller) holdUncovered(ctx context.Context, p *pass, nc *karpv1.NodeClaim, inst *instance.Instance) error {
 	state := inst.CapacityReservationState
-	if state.TargetID == "" || state.CoveringID != "" {
+	if state.TargetID == "" {
+		return nil
+	}
+	if state.CoveringID != "" {
+		if uncoveredAt, ok := c.uncovered[inst.ID]; ok && state.CoveringID == state.TargetID {
+			// EC2's count now includes the slot this held, but our cache won't until its next sync.
+			c.crProvider.MarkMigrated(state.TargetID, inst.ID, uncoveredAt)
+			delete(c.uncovered, inst.ID)
+		}
 		return nil
 	}
 	active, err := c.isActive(ctx, p, nc, state.TargetID)
-	if active && !c.stalled(p, nc, inst.ID, state.TargetID) {
-		p.hold(state.TargetID, inst.ID)
+	if active {
+		c.uncovered[inst.ID] = p.start
+		if !c.stalled(p, nc, inst.ID, state.TargetID) {
+			p.hold(state.TargetID, inst.ID)
+		}
 	}
 	return err
 }
