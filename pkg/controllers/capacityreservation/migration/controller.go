@@ -100,6 +100,7 @@ type Controller struct {
 	deniedBy     map[string]sets.Set[string] // reservation ID -> instances denied since its last backoff or success
 	unauthorized map[string]time.Time        // reservation ID -> end of its backoff
 	covered      sets.Set[slot]              // instances marked migrated in a reservation without completing
+	uncovered    map[string]time.Time        // instance ID -> start of the last pass that saw its target uncovered
 }
 
 // slot is an instance in a reservation.
@@ -124,6 +125,7 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 		deniedBy:         map[string]sets.Set[string]{},
 		unauthorized:     map[string]time.Time{},
 		covered:          sets.New[slot](),
+		uncovered:        map[string]time.Time{},
 	}
 }
 
@@ -140,6 +142,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 
 // pass memoizes API reads for one reconcile.
 type pass struct {
+	start       time.Time
 	nodeClasses map[string]*v1.EC2NodeClass
 	nodePools   map[string]*karpv1.NodePool
 	raw         map[string]map[string]*ec2types.CapacityReservation // nodeclass name -> reservation id -> reservation
@@ -178,6 +181,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		c.publishGauges(&pass{})
 		return reconciler.Result{RequeueAfter: time.Minute}, nil
 	}
+	start := c.clk.Now()
 	instances, err := c.instanceProvider.List(ctx)
 	if err != nil {
 		log.FromContext(ctx).Error(err, "failed listing instances")
@@ -185,6 +189,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	}
 	byID := lo.KeyBy(instances, func(i *instance.Instance) string { return i.ID })
 	p := &pass{
+		start:       start,
 		nodeClasses: map[string]*v1.EC2NodeClass{},
 		nodePools:   map[string]*karpv1.NodePool{},
 		raw:         map[string]map[string]*ec2types.CapacityReservation{},
@@ -206,6 +211,9 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		}
 		inst, ok := byID[id]
 		target := trackedTarget(nc)
+		if ok && target != "" && inst.CapacityReservationState.CoveringID != target {
+			c.uncovered[id] = p.start
+		}
 		// A draining or briefly unlisted instance keeps its EC2 target, so its slot stays held.
 		if !nc.DeletionTimestamp.IsZero() {
 			if ok {
@@ -419,9 +427,10 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 			return err
 		}
 		if requestedAt != "" {
-			c.crProvider.MarkMigrated(target, inst.ID)
+			c.crProvider.MarkMigrated(target, inst.ID, c.uncovered[inst.ID])
 		}
 		delete(c.cases, inst.ID)
+		delete(c.uncovered, inst.ID)
 		c.recorder.Publish(notRelabeledEvent(nc, target, lo.Ternary(nodeClass == nil, "the EC2NodeClass is gone", "the reservation is no longer selected by the EC2NodeClass")))
 		return nil
 	}
@@ -455,11 +464,12 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	}
 	if t, err := time.Parse(time.RFC3339, requestedAt); err == nil {
 		// EC2's count now includes this instance, but our cache won't until its next sync.
-		c.crProvider.MarkMigrated(target, inst.ID)
+		c.crProvider.MarkMigrated(target, inst.ID, c.uncovered[inst.ID])
 		MigrationCoverageDurationSeconds.Observe(c.clk.Since(t).Seconds(), map[string]string{})
 		MigrationCompletedTotal.Inc(map[string]string{caseLabel.Name: lo.ValueOr(c.cases, inst.ID, caseOnDemand)})
 	}
 	delete(c.cases, inst.ID)
+	delete(c.uncovered, inst.ID)
 	c.recorder.Publish(completedEvent(nc, target))
 	log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Info("migrated node into capacity reservation")
 	return nil
@@ -716,6 +726,9 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			continue
 		}
 		calls++
+		if err == nil || ambiguous(err) {
+			c.uncovered[inst.ID] = p.start
+		}
 		if err == nil {
 			p.hold(target, inst.ID)
 			c.crProvider.SetPendingMigrations(p.pending)
@@ -806,7 +819,7 @@ func (c *Controller) holdOrCovered(p *pass, target string, inst *instance.Instan
 		return
 	}
 	if s := (slot{instanceID: inst.ID, reservationID: target}); !c.covered.Has(s) {
-		c.crProvider.MarkMigrated(target, inst.ID)
+		c.crProvider.MarkMigrated(target, inst.ID, c.uncovered[inst.ID])
 		c.covered.Insert(s)
 	}
 }
@@ -860,6 +873,11 @@ func (c *Controller) prune(instances map[string]*instance.Instance) {
 	for s := range c.covered {
 		if _, ok := instances[s.instanceID]; !ok {
 			c.covered.Delete(s)
+		}
+	}
+	for id := range c.uncovered {
+		if _, ok := instances[id]; !ok {
+			delete(c.uncovered, id)
 		}
 	}
 	c.pruneDenials(instances)

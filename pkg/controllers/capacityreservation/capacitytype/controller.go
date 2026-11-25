@@ -164,7 +164,7 @@ func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2
 	}
 	// EC2's count now includes this instance, but our cache won't until its next sync.
 	if instanceID, err := utils.ParseInstanceID(nc.Status.ProviderID); err == nil && first {
-		c.crProvider.MarkMigrated(id, instanceID)
+		c.crProvider.MarkMigrated(id, instanceID, time.Time{})
 	}
 	return true, nil
 }

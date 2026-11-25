@@ -161,7 +161,7 @@ var _ = Describe("Capacity Reservation Provider", func() {
 			_, err := awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-m5.large-1a-1"})
 			Expect(err).ToNot(HaveOccurred())
 			awsEnv.CapacityReservationProvider.SetPendingMigrations(map[string]sets.Set[string]{"cr-m5.large-1a-1": sets.New("i-1")})
-			awsEnv.CapacityReservationProvider.MarkMigrated("cr-m5.large-1a-1", "i-1")
+			awsEnv.CapacityReservationProvider.MarkMigrated("cr-m5.large-1a-1", "i-1", time.Time{})
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-m5.large-1a-1")).To(Equal(9))
 			awsEnv.CapacityReservationProvider.SetPendingMigrations(nil)
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-m5.large-1a-1")).To(Equal(9))

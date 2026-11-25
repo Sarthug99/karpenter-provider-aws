@@ -42,8 +42,9 @@ type Provider interface {
 	MarkTerminated(reservationID, instanceID string)
 	// SetPendingMigrations replaces the set of instances re-targeted in place at each reservation but not yet covered.
 	SetPendingMigrations(map[string]sets.Set[string])
-	// MarkMigrated holds instanceID's slot against the reservation until the next EC2 sync, which then includes it.
-	MarkMigrated(reservationID, instanceID string)
+	// MarkMigrated holds instanceID's slot against the reservation until an EC2 sync issued after uncoveredAt, the last
+	// time it was seen uncovered (zero for now), and skips the hold if such a sync already happened.
+	MarkMigrated(reservationID, instanceID string, uncoveredAt time.Time)
 }
 
 type DefaultProvider struct {

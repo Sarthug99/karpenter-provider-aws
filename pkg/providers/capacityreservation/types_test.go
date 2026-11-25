@@ -30,7 +30,7 @@ var _ = Describe("availabilityCache", func() {
 		requestedAt := clk.Now()
 		clk.Step(time.Second)
 		// Coverage lands while DescribeCapacityReservations is in flight, so its count may predate it.
-		c.MarkMigrated("cr-1", "i-1")
+		c.MarkMigrated("cr-1", "i-1", time.Time{})
 		clk.Step(time.Second)
 		c.syncAvailability(map[string]int{"cr-1": 3}, requestedAt)
 		Expect(c.GetAvailableInstanceCount("cr-1")).To(Equal(2))
@@ -38,10 +38,22 @@ var _ = Describe("availabilityCache", func() {
 		c.syncAvailability(map[string]int{"cr-1": 2}, clk.Now())
 		Expect(c.GetAvailableInstanceCount("cr-1")).To(Equal(2))
 	})
+	It("should skip a migrated hold that a sync issued after the instance was last seen uncovered already counts", func() {
+		clk := clock.NewFakeClock(time.Now())
+		c := &availabilityCache{availabilityCache: cache.New(time.Hour, time.Minute), clk: clk}
+		uncoveredAt := clk.Now()
+		clk.Step(time.Second)
+		c.syncAvailability(map[string]int{"cr-1": 2}, clk.Now())
+		c.MarkMigrated("cr-1", "i-1", uncoveredAt)
+		Expect(c.GetAvailableInstanceCount("cr-1")).To(Equal(2))
+		// An instance seen uncovered after that sync is still held.
+		c.MarkMigrated("cr-1", "i-2", clk.Now())
+		Expect(c.GetAvailableInstanceCount("cr-1")).To(Equal(1))
+	})
 	It("should expire migrated holds for reservations no sync returns", func() {
 		clk := clock.NewFakeClock(time.Now())
 		c := &availabilityCache{availabilityCache: cache.New(time.Hour, time.Minute), clk: clk}
-		c.MarkMigrated("cr-unselected", "i-1")
+		c.MarkMigrated("cr-unselected", "i-1", time.Time{})
 		clk.Step(terminatedInstanceTTL + time.Second)
 		c.syncAvailability(map[string]int{"cr-1": 2}, clk.Now())
 		Expect(c.migrated).To(BeEmpty())
@@ -50,7 +62,7 @@ var _ = Describe("availabilityCache", func() {
 		clk := clock.NewFakeClock(time.Now())
 		c := &availabilityCache{availabilityCache: cache.New(time.Hour, time.Minute), terminationCache: cache.New(time.Hour, time.Minute), clk: clk}
 		c.syncAvailability(map[string]int{"cr-1": 2}, clk.Now())
-		c.MarkMigrated("cr-1", "i-1")
+		c.MarkMigrated("cr-1", "i-1", time.Time{})
 		// A launch hit ReservationCapacityExceeded, then a reserved node terminated.
 		c.SetAvailableInstanceCount("cr-1", 0)
 		c.MarkTerminated("cr-1", "i-2")

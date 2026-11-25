@@ -115,12 +115,13 @@ type availabilityCache struct {
 	clk               clock.Clock
 	// EC2's AvailableInstanceCount lags in-place migrations, so these slots are held until a later sync includes them.
 	pendingMigrations map[string]sets.Set[string]     // reservation ID -> re-targeted, uncovered instance IDs
-	migrated          map[string]map[string]time.Time // reservation ID -> covered instance ID -> coverage time
+	migrated          map[string]map[string]time.Time // reservation ID -> covered instance ID -> time last seen uncovered
 }
 
 type availabilityCacheEntry struct {
-	count    int
-	syncTime time.Time
+	count       int
+	syncTime    time.Time
+	requestedAt time.Time
 }
 
 // syncAvailability stores counts read by a DescribeCapacityReservations call issued at requestedAt.
@@ -130,8 +131,9 @@ func (c *availabilityCache) syncAvailability(availability map[string]int, reques
 	defer c.mu.Unlock()
 	for id, count := range availability {
 		c.availabilityCache.SetDefault(id, &availabilityCacheEntry{
-			count:    count,
-			syncTime: now,
+			count:       count,
+			syncTime:    now,
+			requestedAt: requestedAt,
 		})
 		for instanceID, coveredAt := range c.migrated[id] {
 			// A read issued before coverage may not count the instance yet.
@@ -175,9 +177,15 @@ func (c *availabilityCache) ResetMigrations() {
 	c.migrated = map[string]map[string]time.Time{}
 }
 
-func (c *availabilityCache) MarkMigrated(reservationID, instanceID string) {
+func (c *availabilityCache) MarkMigrated(reservationID, instanceID string, uncoveredAt time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if uncoveredAt.IsZero() {
+		uncoveredAt = c.clk.Now()
+	}
+	if entry, ok := c.availabilityCache.Get(reservationID); ok && entry.(*availabilityCacheEntry).requestedAt.After(uncoveredAt) {
+		return
+	}
 	if c.migrated == nil {
 		c.migrated = map[string]map[string]time.Time{}
 	}
@@ -185,7 +193,7 @@ func (c *availabilityCache) MarkMigrated(reservationID, instanceID string) {
 		c.migrated[reservationID] = map[string]time.Time{}
 	}
 	if _, ok := c.migrated[reservationID][instanceID]; !ok {
-		c.migrated[reservationID][instanceID] = c.clk.Now()
+		c.migrated[reservationID][instanceID] = uncoveredAt
 	}
 }
 
@@ -254,7 +262,8 @@ func (c *availabilityCache) SetAvailableInstanceCount(reservationID string, coun
 	// The forced count is EC2's current verdict, which already includes covered instances.
 	delete(c.migrated, reservationID)
 	c.availabilityCache.SetDefault(reservationID, &availabilityCacheEntry{
-		count:    count,
-		syncTime: c.clk.Now(),
+		count:       count,
+		syncTime:    c.clk.Now(),
+		requestedAt: c.clk.Now(),
 	})
 }
