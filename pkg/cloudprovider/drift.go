@@ -161,10 +161,21 @@ func (c *CloudProvider) isCapacityReservationDrifted(ctx context.Context, nodeCl
 	if err != nil {
 		return "", err
 	}
-	if drifted(i) {
-		return CapacityReservationDrift, nil
+	if !drifted(i) {
+		return "", nil
 	}
-	return "", nil
+	if i.CapacityReservationState.Preference != ec2types.CapacityReservationPreferenceCapacityReservationsOnly ||
+		nodeClaim.Annotations[v1.AnnotationCapacityReservationMigrationTarget] == i.CapacityReservationDetails.ID {
+		// A re-targeted node whose reservation passed its EndDate moves again once EC2 ends it; only a live, unselected one drifts.
+		reservations, err := c.capacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: i.CapacityReservationDetails.ID})
+		if err != nil {
+			return "", fmt.Errorf("getting capacity reservation, %w", err)
+		}
+		if len(reservations) == 0 {
+			return "", nil
+		}
+	}
+	return CapacityReservationDrift, nil
 }
 
 // isPlacementGroupDrifted checks if the node's placement group ID label no longer matches the EC2NodeClass's
