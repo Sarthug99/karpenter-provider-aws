@@ -1436,7 +1436,9 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, c)
 			expectOnDemand(nc, node)
 			gateOff := options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacityMigration: lo.ToPtr(false)}}))
-			ExpectSingletonReconciled(gateOff, capacitytype.NewController(nodeClaimPatchConflict{env.Client}, cloudProvider, awsEnv.CapacityReservationProvider))
+			result, err := capacitytype.NewController(nodeClaimPatchConflict{env.Client}, cloudProvider, awsEnv.CapacityReservationProvider).Reconcile(gateOff)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(5 * time.Second))
 			expectOnDemand(nc, node)
 		})
 		DescribeTable("should sync the Node after completing fails on the Node patch",

@@ -110,8 +110,9 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		})).V(1).Info("updated capacity type for nodeclaims")
 	}
 	if len(errs) != 0 {
+		// A rate-limited Requeue would redo the instance sweep within milliseconds of each conflict.
 		if lo.EveryBy(errs, func(err error) bool { return errors.IsConflict(err) }) {
-			return reconciler.Result{Requeue: true}, nil
+			return reconciler.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return reconciler.Result{}, multierr.Combine(errs...)
 	}
