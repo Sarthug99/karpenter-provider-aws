@@ -533,6 +533,50 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
 		})
+		It("should not hold a stalled move's slot again once its NodeClaim drains", func() {
+			cr := reservation("cr-1", 2)
+			setReservations([]ec2types.CapacityReservation{cr}, cr)
+			nc, _, _ := makeNode(nodeOpts{nodeClaim: func(nc *karpv1.NodeClaim) { nc.Finalizers = []string{karpv1.TerminationFinalizer} }})
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
+			awsEnv.Clock.Step(31 * time.Minute)
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(2))
+			Expect(env.Client.Delete(ctx, nc)).To(Succeed())
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(2))
+		})
+		It("should not hold a draining node's slot for an ambiguous Modify EC2 never applied", func() {
+			cr := reservation("cr-1", 2)
+			setReservations([]ec2types.CapacityReservation{cr}, cr)
+			nc, _, id := makeNode(nodeOpts{nodeClaim: func(nc *karpv1.NodeClaim) { nc.Finalizers = []string{karpv1.TerminationFinalizer} }})
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "InternalError", Fault: smithy.FaultServer}, fake.MaxCalls(1))
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(ec2Instance(id).CapacityReservationSpecification.CapacityReservationTarget).To(BeNil())
+			Expect(env.Client.Delete(ctx, nc)).To(Succeed())
+			ExpectSingletonReconciled(ctx, controller)
+			// DescribeInstances may still lag the call.
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
+			awsEnv.Clock.Step(10 * time.Minute)
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(2))
+		})
+		It("should stop holding an out-of-band target it won't relabel once it stalls", func() {
+			cr := reservation("cr-1", 2)
+			setReservations([]ec2types.CapacityReservation{cr}, cr)
+			nodePool.Spec.Template.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeOnDemand}}}
+			ExpectApplied(ctx, env.Client, nodePool)
+			makeNode(nodeOpts{instance: func(i *ec2types.Instance) {
+				i.CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+					CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr("cr-1")},
+				}
+			}})
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
+			awsEnv.Clock.Step(31 * time.Minute)
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(2))
+		})
 		It("should not hold a draining node's slot past the EC2 sync that counts its coverage", func() {
 			cr := reservation("cr-1", 2)
 			setReservations([]ec2types.CapacityReservation{cr}, cr)

@@ -101,6 +101,7 @@ type Controller struct {
 	unauthorized map[string]time.Time        // reservation ID -> end of its backoff
 	covered      sets.Set[slot]              // instances marked migrated in a reservation without completing
 	uncovered    map[string]time.Time        // instance ID -> start of the last pass that saw its target uncovered
+	pendingSince map[slot]time.Time          // holds without a matching requested-at -> first pass that held them
 }
 
 // slot is an instance in a reservation.
@@ -126,6 +127,7 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 		unauthorized:     map[string]time.Time{},
 		covered:          sets.New[slot](),
 		uncovered:        map[string]time.Time{},
+		pendingSince:     map[slot]time.Time{},
 	}
 }
 
@@ -149,6 +151,7 @@ type pass struct {
 	active      map[string]bool
 	failed      map[string]error // reservation query -> error, so a failing query isn't repeated within the pass
 	pending     map[string]sets.Set[string]
+	waiting     sets.Set[slot] // pendingSince entries checked this pass
 	launching   map[string]int // reservation ID -> reserved NodeClaims not yet launched
 	ineligible  map[string]int
 	stalled     int
@@ -196,6 +199,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		active:      map[string]bool{},
 		failed:      map[string]error{},
 		pending:     map[string]sets.Set[string]{},
+		waiting:     sets.New[slot](),
 		launching:   map[string]int{},
 		ineligible:  map[string]int{},
 	}
@@ -214,27 +218,34 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		if ok && target != "" && inst.CapacityReservationState.CoveringID != target {
 			c.uncovered[id] = p.start
 		}
-		// A draining or briefly unlisted instance keeps its EC2 target, so its slot stays held.
+		// A draining or briefly unlisted instance keeps its EC2 target, so its slot stays held until the move stalls.
 		if !nc.DeletionTimestamp.IsZero() {
 			if ok {
-				c.holdOrCovered(p, target, inst)
+				c.holdOrCovered(p, nc, target, inst)
 			}
 			continue
 		}
 		if !ok {
-			p.hold(target, id)
+			if !c.stalled(p, nc, id, target) {
+				p.hold(target, id)
+			}
 			continue
 		}
 		free, err := c.reconcileTracked(ctx, p, nc, inst)
 		if err != nil {
 			errs = append(errs, serrors.Wrap(err, "NodeClaim", klog.KObj(nc)))
 			// Stay conservative: an error must not release a slot this instance may hold.
-			c.holdOrCovered(p, target, inst)
-			c.holdOrCovered(p, inst.CapacityReservationState.TargetID, inst)
+			c.holdOrCovered(p, nc, target, inst)
+			c.holdOrCovered(p, nc, inst.CapacityReservationState.TargetID, inst)
 			continue
 		}
 		if free {
 			unclaimed = append(unclaimed, &candidate{nodeClaim: nc, instance: inst})
+		}
+	}
+	for s := range c.pendingSince {
+		if !p.waiting.Has(s) {
+			delete(c.pendingSince, s)
 		}
 	}
 	// Publish the ledger before selection so the scheduler and our budget both see in-flight migrations.
@@ -380,10 +391,28 @@ func (c *Controller) holdUncovered(ctx context.Context, p *pass, nc *karpv1.Node
 		return nil
 	}
 	active, err := c.isActive(ctx, p, nc, state.TargetID)
-	if active {
+	if active && !c.stalled(p, nc, inst.ID, state.TargetID) {
 		p.hold(state.TargetID, inst.ID)
 	}
 	return err
+}
+
+// stalled reports whether the instance has waited for coverage by id past stallThreshold, so its hold only blocks launches.
+func (c *Controller) stalled(p *pass, nc *karpv1.NodeClaim, instanceID, id string) bool {
+	if id == "" {
+		return false
+	}
+	if nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget] == id {
+		if requestedAt, err := time.Parse(time.RFC3339, nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]); err == nil {
+			return c.clk.Since(requestedAt) > stallThreshold
+		}
+	}
+	s := slot{instanceID: instanceID, reservationID: id}
+	p.waiting.Insert(s)
+	if _, ok := c.pendingSince[s]; !ok {
+		c.pendingSince[s] = p.start
+	}
+	return c.clk.Since(c.pendingSince[s]) > stallThreshold
 }
 
 func (c *Controller) withinGrace(nc *karpv1.NodeClaim) bool {
@@ -813,9 +842,12 @@ func (p *pass) holdLaunch(nc *karpv1.NodeClaim) {
 }
 
 // holdOrCovered holds the instance's slot in target, unless EC2 already counts it there; then it is held only until the next sync.
-func (c *Controller) holdOrCovered(p *pass, target string, inst *instance.Instance) {
+func (c *Controller) holdOrCovered(p *pass, nc *karpv1.NodeClaim, target string, inst *instance.Instance) {
 	if target == "" || inst.CapacityReservationState.CoveringID != target {
-		p.hold(target, inst.ID)
+		// EC2 only covers the instance with its live target, though DescribeInstances can lag a Modify.
+		if (inst.CapacityReservationState.TargetID == target || c.withinGrace(nc)) && !c.stalled(p, nc, inst.ID, target) {
+			p.hold(target, inst.ID)
+		}
 		return
 	}
 	if s := (slot{instanceID: inst.ID, reservationID: target}); !c.covered.Has(s) {
