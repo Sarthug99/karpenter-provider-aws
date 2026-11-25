@@ -437,7 +437,7 @@ func (c *Controller) relabelable(ctx context.Context, p *pass, nc *karpv1.NodeCl
 	return len(ids) != 0, err
 }
 
-// complete relabels a covered node reserved. The Nodes go first so a failed NodeClaim patch retries both.
+// complete relabels a covered node reserved. The NodeClaim goes first, since capacitytype syncs a reserved NodeClaim's Nodes.
 //
 //nolint:gocyclo
 func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim, inst *instance.Instance, target string) error {
@@ -473,16 +473,6 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		c.recorder.Publish(incompatibleEvent(nc, target, incompatibleReasons[why]))
 	}
 	labels := reservedLabels(target)
-	for _, node := range nodes {
-		if !node.DeletionTimestamp.IsZero() || node.Labels[karpv1.NodeRegisteredLabelKey] != "true" {
-			continue
-		}
-		stored := node.DeepCopy()
-		node.Labels = lo.Assign(node.Labels, labels)
-		if err := c.kubeClient.Patch(ctx, node, client.MergeFrom(stored)); client.IgnoreNotFound(err) != nil {
-			return fmt.Errorf("patching node, %w", err)
-		}
-	}
 	stored := nc.DeepCopy()
 	nc.Labels = lo.Assign(nc.Labels, labels)
 	requestedAt := nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]
@@ -501,6 +491,16 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	delete(c.cases, inst.ID)
 	delete(c.uncovered, inst.ID)
 	log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Info("migrated node into capacity reservation")
+	for _, node := range nodes {
+		if !node.DeletionTimestamp.IsZero() || node.Labels[karpv1.NodeRegisteredLabelKey] != "true" {
+			continue
+		}
+		stored := node.DeepCopy()
+		node.Labels = lo.Assign(node.Labels, labels)
+		if err := c.kubeClient.Patch(ctx, node, client.MergeFrom(stored)); client.IgnoreNotFound(err) != nil {
+			return fmt.Errorf("patching node, %w", err)
+		}
+	}
 	return nil
 }
 

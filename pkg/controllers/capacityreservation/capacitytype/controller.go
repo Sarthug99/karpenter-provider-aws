@@ -150,10 +150,6 @@ func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2
 		return false, nil
 	}
 	labels := lo.PickByKeys(cpNC.Labels, reservedLabelKeys)
-	// Nodes first, so a failed NodeClaim patch retries both.
-	if _, err := c.relabelNodes(ctx, nc, labels); err != nil {
-		return false, err
-	}
 	stored := nc.DeepCopy()
 	nc.Labels = lo.Assign(nc.Labels, labels)
 	_, first := nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]
@@ -166,7 +162,9 @@ func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2
 	if instanceID, err := utils.ParseInstanceID(nc.Status.ProviderID); err == nil && first {
 		c.crProvider.MarkMigrated(id, instanceID, time.Time{})
 	}
-	return true, nil
+	// After the NodeClaim, so a failed Node patch is retried by the reserved NodeClaim path above.
+	_, err := c.relabelNodes(ctx, nc, labels)
+	return true, err
 }
 
 // relabelNodes sets labels on the NodeClaim's registered Nodes that don't already carry them.

@@ -121,6 +121,16 @@ func (c nodeClaimPatchConflict) Patch(ctx context.Context, obj client.Object, pa
 	return c.Client.Patch(ctx, obj, patch, opts...)
 }
 
+// nodePatchError fails every Node patch.
+type nodePatchError struct{ client.Client }
+
+func (c nodePatchError) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if _, ok := obj.(*corev1.Node); ok {
+		return errors.New("patching node")
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
 // failingList counts capacity reservation queries and fails every one.
 type failingList struct {
 	capacityreservation.Provider
@@ -1418,6 +1428,37 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, capacityTypeController)
 			expectOnDemand(nc, node)
 		})
+		It("should leave the Node on-demand when completing fails on the NodeClaim patch", func() {
+			nc, node, id := makeNode()
+			ExpectSingletonReconciled(ctx, controller)
+			cover(id)
+			c := migration.NewController(awsEnv.Clock, nodeClaimPatchConflict{env.Client}, cloudProvider, awsEnv.InstanceProvider, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
+			ExpectSingletonReconciled(ctx, c)
+			expectOnDemand(nc, node)
+			gateOff := options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacityMigration: lo.ToPtr(false)}}))
+			ExpectSingletonReconciled(gateOff, capacitytype.NewController(nodeClaimPatchConflict{env.Client}, cloudProvider, awsEnv.CapacityReservationProvider))
+			expectOnDemand(nc, node)
+		})
+		DescribeTable("should sync the Node after completing fails on the Node patch",
+			func(gate bool) {
+				nc, node, id := makeNode()
+				ExpectSingletonReconciled(ctx, controller)
+				cover(id)
+				gctx := options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacityMigration: lo.ToPtr(gate)}}))
+				if gate {
+					ExpectSingletonReconciled(ctx, migration.NewController(awsEnv.Clock, nodePatchError{env.Client}, cloudProvider, awsEnv.InstanceProvider, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder))
+				} else {
+					_, err := capacitytype.NewController(nodePatchError{env.Client}, cloudProvider, awsEnv.CapacityReservationProvider).Reconcile(gctx)
+					Expect(err).To(HaveOccurred())
+				}
+				Expect(ExpectExists(ctx, env.Client, nc).Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
+				Expect(ExpectExists(ctx, env.Client, node).Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeOnDemand))
+				ExpectSingletonReconciled(gctx, capacityTypeController)
+				expectReserved(nc, node, "cr-1")
+			},
+			Entry("by the migration controller", true),
+			Entry("by the capacitytype controller with the gate off", false),
+		)
 		It("should relabel every Node for a NodeClaim with duplicate Nodes", func() {
 			nc, node, id := makeNode()
 			ExpectSingletonReconciled(ctx, controller)
@@ -1433,7 +1474,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			ct := capacitytype.NewController(env.Client, listThenRun{CloudProvider: cloudProvider, hook: func() {
 				cover(id)
-				// Completes the migration in between, Node first as complete() does.
+				// Completes the migration in between.
 				ExpectSingletonReconciled(ctx, controller)
 			}}, awsEnv.CapacityReservationProvider)
 			ExpectSingletonReconciled(ctx, ct)
