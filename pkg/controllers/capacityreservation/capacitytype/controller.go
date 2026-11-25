@@ -132,6 +132,10 @@ func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2
 	if nc.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved && nc.Labels[cloudprovider.ReservationIDLabel] == id {
 		return c.relabelNodes(ctx, nc, lo.PickByKeys(nc.Labels, reservedLabelKeys))
 	}
+	if nc.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved {
+		// Covered by a reservation it isn't labeled with, e.g. after an out-of-band re-target, so it's unlabeled coverage now.
+		return c.syncCapacityType(ctx, karpv1.CapacityTypeOnDemand, nc)
+	}
 	if nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand || nc.Spec.NodeClassRef == nil ||
 		nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget] != id || options.FromContext(ctx).FeatureGates.ReservedCapacityMigration {
 		return false, nil

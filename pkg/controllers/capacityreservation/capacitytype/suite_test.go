@@ -273,6 +273,21 @@ var _ = Describe("Capacity Reservation Capacity Type Controller", func() {
 			Expect(labels).To(HaveKeyWithValue(corecloudprovider.ReservationIDLabel, reservationID))
 			Expect(labels).To(HaveKeyWithValue(v1.LabelCapacityReservationType, string(v1.CapacityReservationTypeDefault)))
 		})
+		It("should demote a reserved NodeClaim covered by a reservation it isn't labeled with", func() {
+			nodeClaim.Annotations = nil
+			for _, labels := range []map[string]string{nodeClaim.Labels, node.Labels} {
+				labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeReserved
+				labels[corecloudprovider.ReservationIDLabel] = "cr-old"
+				labels[v1.LabelCapacityReservationType] = string(v1.CapacityReservationTypeDefault)
+				labels[v1.LabelCapacityReservationInterruptible] = "false"
+			}
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			ExpectSingletonReconciled(ctx, controller)
+			expectCapacityType(karpv1.CapacityTypeOnDemand)
+			for _, labels := range []map[string]string{ExpectExists(ctx, env.Client, nodeClaim).Labels, ExpectExists(ctx, env.Client, node).Labels} {
+				Expect(labels).ToNot(HaveKey(corecloudprovider.ReservationIDLabel))
+			}
+		})
 		It("should skip a deleting NodeClaim", func() {
 			nodeClaim.Finalizers = []string{karpv1.TerminationFinalizer}
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
