@@ -575,6 +575,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(env.Client.Delete(ctx, nc)).To(Succeed())
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(2))
+			ExpectMetricGaugeValue(migration.MigrationStalled, 1, map[string]string{})
 		})
 		It("should not hold a draining node's slot for an ambiguous Modify EC2 never applied", func() {
 			cr := reservation("cr-1", 2)
@@ -606,6 +607,8 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			awsEnv.Clock.Step(31 * time.Minute)
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(2))
+			Expect(recorder.Calls(migration.EventReasonStalled)).To(Equal(1))
+			ExpectMetricGaugeValue(migration.MigrationStalled, 1, map[string]string{})
 		})
 		It("should not hold a draining node's slot past the EC2 sync that counts its coverage", func() {
 			cr := reservation("cr-1", 2)

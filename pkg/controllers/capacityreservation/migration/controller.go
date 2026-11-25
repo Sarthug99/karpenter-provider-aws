@@ -153,7 +153,7 @@ type pass struct {
 	waiting     sets.Set[slot] // pendingSince entries checked this pass
 	launching   map[string]int // reservation ID -> reserved NodeClaims not yet launched
 	ineligible  map[string]int
-	stalled     int
+	stalled     sets.Set[slot]
 }
 
 type candidate struct {
@@ -202,6 +202,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		waiting:     sets.New[slot](),
 		launching:   map[string]int{},
 		ineligible:  map[string]int{},
+		stalled:     sets.New[slot](),
 	}
 	c.prune(byID)
 
@@ -355,20 +356,13 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 		// The target died while pending; this is now the orphaned case.
 		return true, c.clearTarget(ctx, nc)
 	}
-	raw, ok := nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]
-	if !ok {
+	if _, ok := nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]; !ok {
 		// Only a completed migration's marker lacks requested-at, and its slot is already in EC2's count.
 		return false, nil
 	}
-	if requestedAt, err := time.Parse(time.RFC3339, raw); err == nil {
-		if pendingFor := c.clk.Since(requestedAt); pendingFor > stallThreshold {
-			// EC2 covers a re-target as soon as a slot is free, so a hold this old only keeps a slot from launches.
-			p.stalled++
-			c.recorder.Publish(stalledEvent(nc, target, pendingFor))
-			return false, nil
-		}
+	if !c.stalled(p, nc, inst.ID, target) {
+		p.hold(target, inst.ID)
 	}
-	p.hold(target, inst.ID)
 	return false, nil
 }
 
@@ -403,21 +397,29 @@ func (c *Controller) holdUncovered(ctx context.Context, p *pass, nc *karpv1.Node
 }
 
 // stalled reports whether the instance has waited for coverage by id past stallThreshold, so its hold only blocks launches.
+// EC2 covers a re-target as soon as a slot is free, so a hold that old is released with a Stalled event.
 func (c *Controller) stalled(p *pass, nc *karpv1.NodeClaim, instanceID, id string) bool {
 	if id == "" {
 		return false
 	}
-	if nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget] == id {
-		if requestedAt, err := time.Parse(time.RFC3339, nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]); err == nil {
-			return c.clk.Since(requestedAt) > stallThreshold
-		}
-	}
 	s := slot{instanceID: instanceID, reservationID: id}
-	p.waiting.Insert(s)
-	if _, ok := c.pendingSince[s]; !ok {
-		c.pendingSince[s] = p.start
+	since, err := time.Parse(time.RFC3339, nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt])
+	if nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget] != id || err != nil {
+		p.waiting.Insert(s)
+		if _, ok := c.pendingSince[s]; !ok {
+			c.pendingSince[s] = p.start
+		}
+		since = c.pendingSince[s]
 	}
-	return c.clk.Since(c.pendingSince[s]) > stallThreshold
+	pendingFor := c.clk.Since(since)
+	if pendingFor <= stallThreshold {
+		return false
+	}
+	if !p.stalled.Has(s) {
+		p.stalled.Insert(s)
+		c.recorder.Publish(stalledEvent(nc, id, pendingFor))
+	}
+	return true
 }
 
 func (c *Controller) withinGrace(nc *karpv1.NodeClaim) bool {
@@ -1035,5 +1037,5 @@ func (c *Controller) publishGauges(p *pass) {
 	for _, reason := range reasonLabel.Values {
 		MigrationIneligible.Set(float64(p.ineligible[reason.Name]), map[string]string{reasonLabel.Name: reason.Name})
 	}
-	MigrationStalled.Set(float64(p.stalled), map[string]string{})
+	MigrationStalled.Set(float64(p.stalled.Len()), map[string]string{})
 }
