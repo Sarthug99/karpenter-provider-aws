@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
@@ -165,23 +166,24 @@ func (c *CloudProvider) isCapacityReservationDrifted(ctx context.Context, nodeCl
 	if !drifted(i) {
 		return "", nil
 	}
-	if ended, err := c.retargetedPastEndDate(ctx, nodeClaim, i); err != nil || ended {
-		return "", err
+	if c.retargetedPastEndDate(ctx, nodeClaim, i) {
+		return "", nil
 	}
 	return CapacityReservationDrift, nil
 }
 
 // retargetedPastEndDate reports whether a re-targeted node's reservation passed its EndDate; it moves again once EC2 ends it.
-func (c *CloudProvider) retargetedPastEndDate(ctx context.Context, nodeClaim *karpv1.NodeClaim, i *instance.Instance) (bool, error) {
+func (c *CloudProvider) retargetedPastEndDate(ctx context.Context, nodeClaim *karpv1.NodeClaim, i *instance.Instance) bool {
 	if i.CapacityReservationState.Preference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly &&
 		nodeClaim.Annotations[v1.AnnotationCapacityReservationMigrationTarget] != i.CapacityReservationDetails.ID {
-		return false, nil
+		return false
 	}
-	reservations, err := c.capacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: i.CapacityReservationDetails.ID})
+	ended, err := c.capacityReservationProvider.PastEndDate(ctx, i.CapacityReservationDetails.ID)
 	if err != nil {
-		return false, fmt.Errorf("getting capacity reservation, %w", err)
+		// Without the EndDate it drifts like any deselected reservation, rather than dropping the other drift checks.
+		log.FromContext(ctx).WithValues("capacity-reservation-id", i.CapacityReservationDetails.ID).V(1).Info("failed getting capacity reservation, treating it as not past its end date", "error", err.Error())
 	}
-	return len(reservations) == 0, nil
+	return ended
 }
 
 // isPlacementGroupDrifted checks if the node's placement group ID label no longer matches the EC2NodeClass's

@@ -35,6 +35,8 @@ import (
 
 type Provider interface {
 	List(context.Context, ...v1.CapacityReservationSelectorTerm) ([]*ec2types.CapacityReservation, error)
+	// PastEndDate reports whether EC2 still lists the reservation as active after its EndDate, which it can for up to an hour.
+	PastEndDate(ctx context.Context, id string) (bool, error)
 	GetAvailableInstanceCount(string) int
 	SetAvailableInstanceCount(string, int)
 	MarkLaunched(string)
@@ -78,6 +80,25 @@ func NewProvider(
 }
 
 func (p *DefaultProvider) List(ctx context.Context, selectorTerms ...v1.CapacityReservationSelectorTerm) ([]*ec2types.CapacityReservation, error) {
+	reservations, err := p.list(ctx, selectorTerms...)
+	if err != nil {
+		return nil, err
+	}
+	return p.filterReservations(reservations), nil
+}
+
+func (p *DefaultProvider) PastEndDate(ctx context.Context, id string) (bool, error) {
+	reservations, err := p.list(ctx, v1.CapacityReservationSelectorTerm{ID: id})
+	if err != nil {
+		return false, err
+	}
+	return lo.ContainsBy(reservations, func(r *ec2types.CapacityReservation) bool {
+		return lo.FromPtr(r.CapacityReservationId) == id && r.EndDate != nil && !r.EndDate.After(p.clk.Now())
+	}), nil
+}
+
+// list returns the active reservations the selector terms match, including any past their EndDate.
+func (p *DefaultProvider) list(ctx context.Context, selectorTerms ...v1.CapacityReservationSelectorTerm) ([]*ec2types.CapacityReservation, error) {
 	// Take a write lock over the entire List operation to ensure minimize duplicate DescribeCapacityReservation calls
 	p.Lock()
 	defer p.Unlock()
@@ -85,9 +106,6 @@ func (p *DefaultProvider) List(ctx context.Context, selectorTerms ...v1.Capacity
 	var reservations []*ec2types.CapacityReservation
 	queries := QueriesFromSelectorTerms(selectorTerms...)
 	reservations, queries = p.resolveCachedQueries(queries...)
-	if len(queries) == 0 {
-		return p.filterReservations(reservations), nil
-	}
 	for _, q := range queries {
 		requestedAt := p.clk.Now()
 		paginator := ec2.NewDescribeCapacityReservationsPaginator(p.ec2api, q.DescribeCapacityReservationsInput())
@@ -110,7 +128,7 @@ func (p *DefaultProvider) List(ctx context.Context, selectorTerms ...v1.Capacity
 		p.reservationCache.SetDefault(q.CacheKey(), queryReservations)
 		reservations = append(reservations, queryReservations...)
 	}
-	return p.filterReservations(reservations), nil
+	return reservations, nil
 }
 
 func (p *DefaultProvider) resolveCachedQueries(queries ...*Query) (reservations []*ec2types.CapacityReservation, remainingQueries []*Query) {

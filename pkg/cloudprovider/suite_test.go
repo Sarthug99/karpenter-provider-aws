@@ -1559,6 +1559,37 @@ var _ = Describe("CloudProvider", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(isDrifted).To(Equal(corecloudprovider.DriftReason("")))
 		})
+		DescribeTable("should drift a re-targeted instance in a deselected reservation when its EndDate can't be read",
+			func(fail bool) {
+				awsEnv.EC2API.DescribeCapacityReservationsOutput.Set(&ec2.DescribeCapacityReservationsOutput{CapacityReservations: lo.Ternary(fail, []ec2types.CapacityReservation{{
+					CapacityReservationId: lo.ToPtr("cr-limited"), OwnerId: lo.ToPtr("012345678901"), AvailableInstanceCount: lo.ToPtr[int32](1), State: ec2types.CapacityReservationStateActive,
+					EndDate: lo.ToPtr(awsEnv.Clock.Now().Add(-time.Minute)), EndDateType: ec2types.EndDateTypeLimited,
+				}}, nil)})
+				awsEnv.CapacityReservationCache.Flush()
+				out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
+				out.Reservations[0].Instances[0].SpotInstanceRequestId = nil
+				out.Reservations[0].Instances[0].CapacityReservationId = lo.ToPtr("cr-limited")
+				out.Reservations[0].Instances[0].CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+					CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr("cr-limited")},
+				}
+				awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(out)
+				awsEnv.InstanceCache.Flush()
+				nodeClaim.Labels = lo.Assign(nodeClaim.Labels, map[string]string{
+					karpv1.CapacityTypeLabelKey:              karpv1.CapacityTypeReserved,
+					corecloudprovider.ReservationIDLabel:     "cr-limited",
+					v1.LabelCapacityReservationType:          string(v1.CapacityReservationTypeDefault),
+					v1.LabelCapacityReservationInterruptible: "false",
+				})
+				if fail {
+					awsEnv.EC2API.NextError.Set(&smithy.GenericAPIError{Code: "RequestLimitExceeded"})
+				}
+				isDrifted, err := cloudProvider.IsDrifted(ctx, nodeClaim)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(isDrifted).To(Equal(cloudprovider.CapacityReservationDrift))
+			},
+			Entry("EC2 doesn't return it, e.g. an unshared reservation", false),
+			Entry("the lookup fails", true),
+		)
 		It("should drift a capacity-reservations-only instance labeled on-demand in an unselected reservation only without a migration target", func() {
 			// An orphaned node, relabeled on-demand, re-targeted in place at a reservation that then left the EC2NodeClass.
 			out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
