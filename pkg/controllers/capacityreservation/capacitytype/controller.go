@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -44,13 +45,15 @@ import (
 )
 
 type Controller struct {
+	clk        clock.Clock
 	cp         cloudprovider.CloudProvider
 	kubeClient client.Client
 	crProvider capacityreservation.Provider
 }
 
-func NewController(kubeClient client.Client, cp cloudprovider.CloudProvider, crProvider capacityreservation.Provider) *Controller {
+func NewController(clk clock.Clock, kubeClient client.Client, cp cloudprovider.CloudProvider, crProvider capacityreservation.Provider) *Controller {
 	return &Controller{
+		clk:        clk,
 		cp:         cp,
 		kubeClient: kubeClient,
 		crProvider: crProvider,
@@ -79,6 +82,8 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	if err != nil {
 		return reconciler.Result{}, fmt.Errorf("listing instance types, %w", err)
 	}
+	// After any coverage the instance snapshot shows.
+	observed := c.clk.Now()
 	providerIDsToCPNodeClaims := lo.SliceToMap(cpNodeClaims, func(nc *karpv1.NodeClaim) (string, *karpv1.NodeClaim) {
 		return nc.Status.ProviderID, nc
 	})
@@ -93,7 +98,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		var updated bool
 		var err error
 		if cpNC.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved {
-			updated, err = c.promote(ctx, nodeClasses, cpNC, &ncs.Items[i])
+			updated, err = c.promote(ctx, nodeClasses, cpNC, &ncs.Items[i], observed)
 		} else {
 			updated, err = c.syncCapacityType(ctx, cpNC.Labels[karpv1.CapacityTypeLabelKey], &ncs.Items[i])
 		}
@@ -124,7 +129,7 @@ var reservedLabelKeys = append(cloudprovider.ReservedCapacityLabels.UnsortedList
 // promote finishes migrations whose controller is off and syncs a reserved NodeClaim's Nodes; other coverage stays on-demand.
 //
 //nolint:gocyclo
-func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2NodeClass, cpNC, nc *karpv1.NodeClaim) (bool, error) {
+func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2NodeClass, cpNC, nc *karpv1.NodeClaim, observed time.Time) (bool, error) {
 	id := cpNC.Labels[cloudprovider.ReservationIDLabel]
 	if !nc.DeletionTimestamp.IsZero() || id == "" {
 		return false, nil
@@ -163,9 +168,8 @@ func (c *Controller) promote(ctx context.Context, nodeClasses map[string]*v1.EC2
 	if err := c.kubeClient.Patch(ctx, nc, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 		return false, client.IgnoreNotFound(serrors.Wrap(fmt.Errorf("patching nodeclaim, %w", err), "NodeClaim", klog.KObj(nc)))
 	}
-	// EC2's count now includes this instance, but our cache won't until its next sync.
 	if instanceID, err := utils.ParseInstanceID(nc.Status.ProviderID); err == nil && first {
-		c.crProvider.MarkMigrated(id, instanceID, time.Time{})
+		c.crProvider.MarkMigrated(id, instanceID, observed)
 	}
 	// After the NodeClaim, so a failed Node patch is retried by the reserved NodeClaim path above.
 	_, err := c.relabelNodes(ctx, nc, labels)

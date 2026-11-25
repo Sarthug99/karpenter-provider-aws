@@ -114,7 +114,7 @@ func NewControllers(
 		ssminvalidation.NewController(ssmCache, amiProvider),
 		status.NewController[*v1.EC2NodeClass](kubeClient, mgr.GetEventRecorderFor("karpenter")), //nolint:staticcheck // SA1019: will be replaced by mgr.GetEventRecorder once operatorpkg is updated
 		controllersversion.NewController(versionProvider, versionProvider.UpdateVersionWithValidation),
-		crcapacitytype.NewController(kubeClient, cloudProvider, capacityReservationProvider),
+		crcapacitytype.NewController(clk, kubeClient, cloudProvider, capacityReservationProvider),
 		crexpiration.NewController(clk, kubeClient, cloudProvider, capacityReservationProvider),
 		metrics.NewController(kubeClient, cloudProvider),
 		arczonalshiftcontroller.NewController(kubeClient, recorder, zonalshiftProvider),

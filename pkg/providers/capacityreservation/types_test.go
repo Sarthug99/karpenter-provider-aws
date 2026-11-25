@@ -28,27 +28,34 @@ var _ = Describe("availabilityCache", func() {
 		clk := clock.NewFakeClock(time.Now())
 		c := &availabilityCache{availabilityCache: cache.New(time.Hour, time.Minute), clk: clk}
 		requestedAt := clk.Now()
+		// Coverage lands while DescribeCapacityReservations is in flight, and a later DescribeInstances shows it.
 		clk.Step(time.Second)
-		// Coverage lands while DescribeCapacityReservations is in flight, so its count may predate it.
-		c.MarkMigrated("cr-1", "i-1", time.Time{})
+		observedAt := clk.Now()
 		clk.Step(time.Second)
+		c.MarkMigrated("cr-1", "i-1", observedAt)
 		c.syncAvailability(map[string]int{"cr-1": 3}, requestedAt)
 		Expect(c.GetAvailableInstanceCount("cr-1")).To(Equal(2))
 
 		c.syncAvailability(map[string]int{"cr-1": 2}, clk.Now())
 		Expect(c.GetAvailableInstanceCount("cr-1")).To(Equal(2))
 	})
-	It("should skip a migrated hold that a sync issued after the instance was last seen uncovered already counts", func() {
+	It("should keep a migrated hold when a sync issued before coverage was seen already returned", func() {
 		clk := clock.NewFakeClock(time.Now())
 		c := &availabilityCache{availabilityCache: cache.New(time.Hour, time.Minute), clk: clk}
-		uncoveredAt := clk.Now()
+		clk.Step(time.Second)
+		c.syncAvailability(map[string]int{"cr-1": 3}, clk.Now())
+		clk.Step(time.Second)
+		c.MarkMigrated("cr-1", "i-1", clk.Now())
+		Expect(c.GetAvailableInstanceCount("cr-1")).To(Equal(2))
+	})
+	It("should skip a migrated hold that a sync issued after coverage was seen already counts", func() {
+		clk := clock.NewFakeClock(time.Now())
+		c := &availabilityCache{availabilityCache: cache.New(time.Hour, time.Minute), clk: clk}
+		observedAt := clk.Now()
 		clk.Step(time.Second)
 		c.syncAvailability(map[string]int{"cr-1": 2}, clk.Now())
-		c.MarkMigrated("cr-1", "i-1", uncoveredAt)
+		c.MarkMigrated("cr-1", "i-1", observedAt)
 		Expect(c.GetAvailableInstanceCount("cr-1")).To(Equal(2))
-		// An instance seen uncovered after that sync is still held.
-		c.MarkMigrated("cr-1", "i-2", clk.Now())
-		Expect(c.GetAvailableInstanceCount("cr-1")).To(Equal(1))
 	})
 	It("should expire migrated holds for reservations no sync returns", func() {
 		clk := clock.NewFakeClock(time.Now())

@@ -115,7 +115,7 @@ type availabilityCache struct {
 	clk               clock.Clock
 	// EC2's AvailableInstanceCount lags in-place migrations, so these slots are held until a later sync includes them.
 	pendingMigrations map[string]sets.Set[string]     // reservation ID -> re-targeted, uncovered instance IDs
-	migrated          map[string]map[string]time.Time // reservation ID -> covered instance ID -> time last seen uncovered
+	migrated          map[string]map[string]time.Time // reservation ID -> covered instance ID -> time known to follow coverage
 }
 
 type availabilityCacheEntry struct {
@@ -177,13 +177,13 @@ func (c *availabilityCache) ResetMigrations() {
 	c.migrated = map[string]map[string]time.Time{}
 }
 
-func (c *availabilityCache) MarkMigrated(reservationID, instanceID string, uncoveredAt time.Time) {
+func (c *availabilityCache) MarkMigrated(reservationID, instanceID string, observedAt time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if uncoveredAt.IsZero() {
-		uncoveredAt = c.clk.Now()
+	if observedAt.IsZero() {
+		observedAt = c.clk.Now()
 	}
-	if entry, ok := c.availabilityCache.Get(reservationID); ok && entry.(*availabilityCacheEntry).requestedAt.After(uncoveredAt) {
+	if entry, ok := c.availabilityCache.Get(reservationID); ok && entry.(*availabilityCacheEntry).requestedAt.After(observedAt) {
 		return
 	}
 	if c.migrated == nil {
@@ -193,7 +193,7 @@ func (c *availabilityCache) MarkMigrated(reservationID, instanceID string, uncov
 		c.migrated[reservationID] = map[string]time.Time{}
 	}
 	if _, ok := c.migrated[reservationID][instanceID]; !ok {
-		c.migrated[reservationID][instanceID] = uncoveredAt
+		c.migrated[reservationID][instanceID] = observedAt
 	}
 }
 

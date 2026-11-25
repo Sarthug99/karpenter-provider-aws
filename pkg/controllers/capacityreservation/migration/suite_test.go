@@ -93,7 +93,7 @@ var _ = BeforeSuite(func() {
 	cloudProvider = cloudprovider.New(awsEnv.InstanceTypesProvider, awsEnv.InstanceProvider, events.NewRecorder(&record.FakeRecorder{}),
 		env.Client, awsEnv.AMIProvider, awsEnv.SecurityGroupProvider, awsEnv.CapacityReservationProvider, awsEnv.PlacementGroupProvider, awsEnv.InstanceTypeStore, lo.ToPtr(""))
 	recorder = coretest.NewEventRecorder()
-	capacityTypeController = capacitytype.NewController(env.Client, cloudProvider, awsEnv.CapacityReservationProvider)
+	capacityTypeController = capacitytype.NewController(awsEnv.Clock, env.Client, cloudProvider, awsEnv.CapacityReservationProvider)
 })
 
 var _ = AfterSuite(func() {
@@ -218,6 +218,21 @@ func (l listThenRun) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
 	ncs, err := l.CloudProvider.List(ctx)
 	l.hook()
 	return ncs, err
+}
+
+// nodeClassGetThenRun runs a hook once, on the first EC2NodeClass Get, to interleave work after the instance snapshot.
+type nodeClassGetThenRun struct {
+	client.Client
+	hook *func()
+}
+
+func (c nodeClassGetThenRun) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*v1.EC2NodeClass); ok && *c.hook != nil {
+		hook := *c.hook
+		*c.hook = nil
+		hook()
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
 }
 
 func reservation(id string, available int32, mutate ...func(*ec2types.CapacityReservation)) ec2types.CapacityReservation {
@@ -494,23 +509,28 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
 		})
-		It("should not hold a covered slot that an EC2 sync issued after the Modify already counts", func() {
+		It("should hold a covered slot until an EC2 sync issued after its coverage was seen", func() {
 			cr := reservation("cr-1", 5)
 			setReservations([]ec2types.CapacityReservation{cr}, cr)
-			_, _, id1 := makeNode()
-			_, _, id2 := makeNode()
+			_, _, id := makeNode()
 			ExpectSingletonReconciled(ctx, controller)
-			Expect(modifyCalls()).To(Equal(2))
-			cover(id1)
-			cover(id2)
+			Expect(modifyCalls()).To(Equal(1))
+			// A sync after the Modify but before coverage doesn't count the instance.
 			awsEnv.Clock.Step(20 * time.Second)
-			awsEnv.EC2API.DescribeCapacityReservationsOutput.Set(&ec2.DescribeCapacityReservationsOutput{CapacityReservations: []ec2types.CapacityReservation{reservation("cr-1", 3)}})
 			awsEnv.CapacityReservationCache.Flush()
 			_, err := awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-1"})
 			Expect(err).ToNot(HaveOccurred())
+			cover(id)
 			awsEnv.Clock.Step(40 * time.Second)
 			ExpectSingletonReconciled(ctx, controller)
-			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(3))
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(4))
+
+			awsEnv.Clock.Step(time.Second)
+			awsEnv.EC2API.DescribeCapacityReservationsOutput.Set(&ec2.DescribeCapacityReservationsOutput{CapacityReservations: []ec2types.CapacityReservation{reservation("cr-1", 4)}})
+			awsEnv.CapacityReservationCache.Flush()
+			_, err = awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-1"})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(4))
 		})
 		It("should rebuild the ledger from annotations after a restart", func() {
 			cr := reservation("cr-1", 2)
@@ -1231,6 +1251,12 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(recorder.Calls(migration.EventReasonCompleted)).To(Equal(0))
 			_, found := FindMetricWithLabelValues("karpenter_capacity_reservation_migration_completed_total", map[string]string{})
 			Expect(found).To(BeFalse())
+			// EC2 may have covered it after the last sync, so its slot is held until the next one.
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
+			awsEnv.Clock.Step(time.Second)
+			awsEnv.CapacityReservationCache.Flush()
+			_, err = awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-1"})
+			Expect(err).ToNot(HaveOccurred())
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(2))
 		})
 		It("should not adopt an instance targeting a reservation it wouldn't choose", func() {
@@ -1403,6 +1429,23 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			// The slot stays held until EC2's next sync counts the instance.
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
 		})
+		It("should not hold a gate-off completion's slot once a sync issued after its coverage was seen counts it", func() {
+			_, _, id := makeNode()
+			ExpectSingletonReconciled(ctx, controller)
+			awsEnv.CapacityReservationProvider.SetPendingMigrations(nil)
+			gateOff := options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacityMigration: lo.ToPtr(false)}}))
+			cover(id)
+			hook := func() {
+				awsEnv.Clock.Step(time.Second)
+				awsEnv.EC2API.DescribeCapacityReservationsOutput.Set(&ec2.DescribeCapacityReservationsOutput{CapacityReservations: []ec2types.CapacityReservation{reservation("cr-1", 1)}})
+				awsEnv.CapacityReservationCache.Flush()
+				_, err := awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-1"})
+				Expect(err).ToNot(HaveOccurred())
+				awsEnv.Clock.Step(time.Second)
+			}
+			ExpectSingletonReconciled(gateOff, capacitytype.NewController(awsEnv.Clock, nodeClassGetThenRun{env.Client, &hook}, cloudProvider, awsEnv.CapacityReservationProvider))
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(1))
+		})
 		DescribeTable("should relabel a finished migration again after a stale snapshot demotes it",
 			func(gate bool) {
 				gctx := options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacityMigration: lo.ToPtr(gate)}}))
@@ -1449,7 +1492,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, c)
 			expectOnDemand(nc, node)
 			gateOff := options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacityMigration: lo.ToPtr(false)}}))
-			result, err := capacitytype.NewController(nodeClaimPatchConflict{env.Client}, cloudProvider, awsEnv.CapacityReservationProvider).Reconcile(gateOff)
+			result, err := capacitytype.NewController(awsEnv.Clock, nodeClaimPatchConflict{env.Client}, cloudProvider, awsEnv.CapacityReservationProvider).Reconcile(gateOff)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.RequeueAfter).To(Equal(5 * time.Second))
 			expectOnDemand(nc, node)
@@ -1463,7 +1506,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 				if gate {
 					ExpectSingletonReconciled(ctx, migration.NewController(awsEnv.Clock, nodePatchError{env.Client}, cloudProvider, awsEnv.InstanceProvider, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder))
 				} else {
-					_, err := capacitytype.NewController(nodePatchError{env.Client}, cloudProvider, awsEnv.CapacityReservationProvider).Reconcile(gctx)
+					_, err := capacitytype.NewController(awsEnv.Clock, nodePatchError{env.Client}, cloudProvider, awsEnv.CapacityReservationProvider).Reconcile(gctx)
 					Expect(err).To(HaveOccurred())
 				}
 				Expect(ExpectExists(ctx, env.Client, nc).Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
@@ -1487,7 +1530,7 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 		It("should keep capacitytype from demoting a flip made after its instance snapshot", func() {
 			nc, node, id := makeNode()
 			ExpectSingletonReconciled(ctx, controller)
-			ct := capacitytype.NewController(env.Client, listThenRun{CloudProvider: cloudProvider, hook: func() {
+			ct := capacitytype.NewController(awsEnv.Clock, env.Client, listThenRun{CloudProvider: cloudProvider, hook: func() {
 				cover(id)
 				// Completes the migration in between.
 				ExpectSingletonReconciled(ctx, controller)

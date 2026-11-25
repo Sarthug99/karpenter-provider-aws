@@ -100,7 +100,6 @@ type Controller struct {
 	deniedBy     map[string]sets.Set[string] // reservation ID -> instances denied since its last backoff or success
 	unauthorized map[string]time.Time        // reservation ID -> end of its backoff
 	covered      sets.Set[slot]              // instances marked migrated in a reservation without completing
-	uncovered    map[string]time.Time        // instance ID -> start of the last pass that saw its target uncovered
 	pendingSince map[slot]time.Time          // holds without a matching requested-at -> first pass that held them
 }
 
@@ -126,7 +125,6 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 		deniedBy:         map[string]sets.Set[string]{},
 		unauthorized:     map[string]time.Time{},
 		covered:          sets.New[slot](),
-		uncovered:        map[string]time.Time{},
 		pendingSince:     map[slot]time.Time{},
 	}
 }
@@ -145,6 +143,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 // pass memoizes API reads for one reconcile.
 type pass struct {
 	start       time.Time
+	observed    time.Time // when the DescribeInstances sweep returned, so after any coverage it shows
 	nodeClasses map[string]*v1.EC2NodeClass
 	nodePools   map[string]*karpv1.NodePool
 	raw         map[string]map[string]*ec2types.CapacityReservation // nodeclass name -> reservation id -> reservation
@@ -193,6 +192,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	byID := lo.KeyBy(instances, func(i *instance.Instance) string { return i.ID })
 	p := &pass{
 		start:       start,
+		observed:    c.clk.Now(),
 		nodeClasses: map[string]*v1.EC2NodeClass{},
 		nodePools:   map[string]*karpv1.NodePool{},
 		raw:         map[string]map[string]*ec2types.CapacityReservation{},
@@ -215,9 +215,6 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		}
 		inst, ok := byID[id]
 		target := trackedTarget(nc)
-		if ok && target != "" && inst.CapacityReservationState.CoveringID != target {
-			c.uncovered[id] = p.start
-		}
 		// A draining or briefly unlisted instance keeps its EC2 target, so its slot stays held until the move stalls.
 		if !nc.DeletionTimestamp.IsZero() {
 			if ok {
@@ -391,19 +388,16 @@ func (c *Controller) holdUncovered(ctx context.Context, p *pass, nc *karpv1.Node
 		return nil
 	}
 	if state.CoveringID != "" {
-		if uncoveredAt, ok := c.uncovered[inst.ID]; ok && state.CoveringID == state.TargetID {
-			// EC2's count now includes the slot this held, but our cache won't until its next sync.
-			c.crProvider.MarkMigrated(state.TargetID, inst.ID, uncoveredAt)
-			delete(c.uncovered, inst.ID)
+		if s := (slot{instanceID: inst.ID, reservationID: state.TargetID}); state.CoveringID == state.TargetID && !c.covered.Has(s) {
+			// EC2's count may not include the slot this held until a sync after this sweep.
+			c.crProvider.MarkMigrated(state.TargetID, inst.ID, p.observed)
+			c.covered.Insert(s)
 		}
 		return nil
 	}
 	active, err := c.isActive(ctx, p, nc, state.TargetID)
-	if active {
-		c.uncovered[inst.ID] = p.start
-		if !c.stalled(p, nc, inst.ID, state.TargetID) {
-			p.hold(state.TargetID, inst.ID)
-		}
+	if active && !c.stalled(p, nc, inst.ID, state.TargetID) {
+		p.hold(state.TargetID, inst.ID)
 	}
 	return err
 }
@@ -462,15 +456,11 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	}
 	if nodeClass == nil || !adoptable(nodeClass, target) {
 		// Like an open ODCR match, an unselected reservation stays on-demand; adoption relabels it if it is selected again.
-		requestedAt := nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]
 		if err := c.clearTarget(ctx, nc); err != nil {
 			return err
 		}
-		if requestedAt != "" {
-			c.crProvider.MarkMigrated(target, inst.ID, c.uncovered[inst.ID])
-		}
+		c.crProvider.MarkMigrated(target, inst.ID, p.observed)
 		delete(c.cases, inst.ID)
-		delete(c.uncovered, inst.ID)
 		c.recorder.Publish(notRelabeledEvent(nc, target, lo.Ternary(nodeClass == nil, "the EC2NodeClass is gone", "the reservation is no longer selected by the EC2NodeClass")))
 		return nil
 	}
@@ -492,15 +482,14 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	if err := c.kubeClient.Patch(ctx, nc, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 		return client.IgnoreNotFound(fmt.Errorf("patching nodeclaim, %w", err))
 	}
+	// Even an adoption may have been covered after the cache's last sync.
+	c.crProvider.MarkMigrated(target, inst.ID, p.observed)
 	if t, err := time.Parse(time.RFC3339, requestedAt); err == nil {
-		// EC2's count now includes this instance, but our cache won't until its next sync.
-		c.crProvider.MarkMigrated(target, inst.ID, c.uncovered[inst.ID])
 		MigrationCoverageDurationSeconds.Observe(c.clk.Since(t).Seconds(), map[string]string{})
 		MigrationCompletedTotal.Inc(map[string]string{caseLabel.Name: lo.ValueOr(c.cases, inst.ID, caseOnDemand)})
 		c.recorder.Publish(completedEvent(nc, target))
 	}
 	delete(c.cases, inst.ID)
-	delete(c.uncovered, inst.ID)
 	log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Info("migrated node into capacity reservation")
 	for _, node := range nodes {
 		if !node.DeletionTimestamp.IsZero() || node.Labels[karpv1.NodeRegisteredLabelKey] != "true" {
@@ -767,9 +756,6 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			continue
 		}
 		calls++
-		if err == nil || ambiguous(err) {
-			c.uncovered[inst.ID] = p.start
-		}
 		if err == nil {
 			p.hold(target, inst.ID)
 			c.crProvider.SetPendingMigrations(p.pending)
@@ -863,7 +849,7 @@ func (c *Controller) holdOrCovered(p *pass, nc *karpv1.NodeClaim, target string,
 		return
 	}
 	if s := (slot{instanceID: inst.ID, reservationID: target}); !c.covered.Has(s) {
-		c.crProvider.MarkMigrated(target, inst.ID, c.uncovered[inst.ID])
+		c.crProvider.MarkMigrated(target, inst.ID, p.observed)
 		c.covered.Insert(s)
 	}
 }
@@ -917,11 +903,6 @@ func (c *Controller) prune(instances map[string]*instance.Instance) {
 	for s := range c.covered {
 		if _, ok := instances[s.instanceID]; !ok {
 			c.covered.Delete(s)
-		}
-	}
-	for id := range c.uncovered {
-		if _, ok := instances[id]; !ok {
-			delete(c.uncovered, id)
 		}
 	}
 	c.pruneDenials(instances)

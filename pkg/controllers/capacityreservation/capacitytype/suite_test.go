@@ -70,7 +70,7 @@ var _ = BeforeSuite(func() {
 
 	cloudProvider := cloudprovider.New(awsEnv.InstanceTypesProvider, awsEnv.InstanceProvider, events.NewRecorder(&record.FakeRecorder{}),
 		env.Client, awsEnv.AMIProvider, awsEnv.SecurityGroupProvider, awsEnv.CapacityReservationProvider, awsEnv.PlacementGroupProvider, awsEnv.InstanceTypeStore, lo.ToPtr(""))
-	controller = capacitytype.NewController(env.Client, cloudProvider, awsEnv.CapacityReservationProvider)
+	controller = capacitytype.NewController(awsEnv.Clock, env.Client, cloudProvider, awsEnv.CapacityReservationProvider)
 })
 
 var _ = AfterSuite(func() {
