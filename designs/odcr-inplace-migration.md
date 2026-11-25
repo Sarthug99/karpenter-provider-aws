@@ -98,7 +98,7 @@ sequenceDiagram
 | Consolidation | A migrated node is priced as reserved (≈$0), so consolidation stops replacing it and may pack pods onto it. Nodes tainted `karpenter.sh/disrupted` are skipped. |
 | Drift | Targets come only from NodeClass status, so `CapacityReservationDrift` stays false. **Gotcha (D5):** in a reserved-only NodePool, an orphaned node is relabeled on-demand and may be replaced by requirement drift before migration (1m) saves it. |
 | capacitytype controller | Lists NodeClaims before instances, so a stale snapshot can't undo a fresh relabel. Also completes annotated moves when the gate is off, keeps Node labels in line with their NodeClaim, and strips the interruptible label on demotion. |
-| Rollback | Versions without the target-equals-covering classification label migrated nodes `on-demand`: reserved-only NodePools replace them and DaemonSets requiring `reserved` lose pods. Documented in the upgrade guide; backporting the classification to release branches is a follow-up. |
+| Rollback | Versions without the target-equals-covering classification demote migrated nodes but keep `interruptible=false`, so `InstanceTypeNotFound` drift replaces them in any NodePool, and DaemonSets requiring `reserved` lose pods. Documented with a workaround; backporting is a follow-up. |
 | Expiration | Only Capacity Blocks near their end are deleted, and they're never migration targets. |
 | DRA | Unchanged. Only labels change; devices and ResourceSlices are untouched. |
 | Spot / open / Capacity Block / interruptible | Never migrated. EC2 also rejects open → target, and Capacity Block or interruptible targets. |

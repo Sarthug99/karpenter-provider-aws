@@ -156,7 +156,7 @@ To keep free slots for new launches, select fewer reservations or restrict the N
 {{% /alert %}}
 
 {{% alert title="Warning" color="warning" %}}
-Rolling back to a Karpenter version without this classification labels migrated nodes `on-demand` again. NodePools that only allow `reserved` replace them, and DaemonSet pods that require `reserved` are removed from them.
+Rolling back to a Karpenter version without this classification labels migrated nodes `on-demand` again but keeps their `karpenter.k8s.aws/capacity-reservation-interruptible` label, which on-demand offerings don't allow. Drift (`InstanceTypeNotFound`) then replaces them in any NodePool, subject to disruption budgets and `karpenter.sh/do-not-disrupt`, and DaemonSet pods that require `reserved` are removed from them. To keep the nodes, remove that label from their NodeClaims once they are relabeled `on-demand`.
 
 The move can't be undone. Once an instance targets a capacity reservation, it can't return to on-demand without being replaced.
 Nodes launched before `ReservedCapacity` was enabled have the `open` capacity reservation preference and are never moved.
