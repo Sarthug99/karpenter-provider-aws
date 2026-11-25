@@ -1790,6 +1790,29 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			ExpectSingletonReconciled(ctx, controller)
 			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(1))
 		})
+		It("should pause all migration, quietly, where EC2 only re-targets stopped instances", func() {
+			makeNode()
+			makeNode()
+			lists := 0
+			c := migration.NewController(awsEnv.Clock, env.Client, cloudProvider, countingList{awsEnv.InstanceProvider, &lists}, awsEnv.CapacityReservationProvider, awsEnv.ZonalShiftProvider, recorder)
+			unsupported := &smithy.GenericAPIError{Code: "IncorrectInstanceState", Message: "The instance 'i-1' is not in an allowed state: stopped", Fault: smithy.FaultClient}
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(unsupported, fake.MaxCalls(2))
+			for i, delay := range []time.Duration{time.Hour, 2 * time.Hour} {
+				ExpectSingletonReconciled(ctx, c)
+				Expect(modifyCalls()).To(Equal(i + 1))
+				// The instance sweep is skipped too while nothing is pending.
+				awsEnv.Clock.Step(delay - time.Minute)
+				ExpectSingletonReconciled(ctx, c)
+				Expect(modifyCalls()).To(Equal(i + 1))
+				Expect(lists).To(Equal(i + 1))
+				awsEnv.Clock.Step(2 * time.Minute)
+			}
+			Expect(recorder.Calls(migration.EventReasonFailed)).To(Equal(0))
+			_, found := FindMetricWithLabelValues("karpenter_capacity_reservation_migration_attempts_total", map[string]string{})
+			Expect(found).To(BeFalse())
+			ExpectSingletonReconciled(ctx, c)
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.SuccessfulCalls()).To(Equal(2))
+		})
 		It("should skip a node whose instance is gone", func() {
 			nc, _, _ := makeNode()
 			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "InvalidInstanceID.NotFound", Fault: smithy.FaultClient}, fake.MaxCalls(1))

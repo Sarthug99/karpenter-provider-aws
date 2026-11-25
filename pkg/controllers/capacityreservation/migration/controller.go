@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
@@ -69,6 +70,8 @@ const (
 	maxBackoff              = time.Hour
 	// DescribeInstances can lag a Modify, so a missing target isn't trusted until this long after the call.
 	modifyVisibilityGrace = 5 * time.Minute
+	unsupportedBackoff    = time.Hour
+	maxUnsupportedBackoff = 6 * time.Hour
 )
 
 // serverErrorCodes are EC2 faults after which a Modify may still have been applied.
@@ -101,6 +104,7 @@ type Controller struct {
 	unauthorized map[string]time.Time        // reservation ID -> end of its backoff
 	covered      sets.Set[slot]              // instances marked migrated in a reservation without completing
 	pendingSince map[slot]time.Time          // holds without a matching requested-at -> first pass that held them
+	unsupported  backoffEntry                // EC2 can't re-target running instances in this Region yet
 }
 
 // slot is an instance in a reservation.
@@ -250,7 +254,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	c.crProvider.SetPendingMigrations(p.pending)
 
 	var candidates []*candidate
-	for _, u := range unclaimed {
+	for _, u := range lo.Ternary(c.clk.Now().Before(c.unsupported.next), nil, unclaimed) {
 		cand, err := c.eligible(ctx, p, u.nodeClaim, u.instance)
 		if err != nil {
 			errs = append(errs, serrors.Wrap(err, "NodeClaim", klog.KObj(u.nodeClaim)))
@@ -289,6 +293,9 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 func (c *Controller) idle(ctx context.Context, nodeClaims []*karpv1.NodeClaim) (bool, error) {
 	if lo.SomeBy(nodeClaims, func(nc *karpv1.NodeClaim) bool { return trackedTarget(nc) != "" }) {
 		return false, nil
+	}
+	if c.clk.Now().Before(c.unsupported.next) {
+		return true, nil
 	}
 	nodeClasses := &v1.EC2NodeClassList{}
 	if err := c.kubeClient.List(ctx, nodeClasses); err != nil {
@@ -758,7 +765,17 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			continue
 		}
 		calls++
+		if unsupportedInRegion(err) {
+			if clearErr := c.clearTarget(ctx, nc); clearErr != nil {
+				errs = append(errs, serrors.Wrap(clearErr, "NodeClaim", klog.KObj(nc)))
+			}
+			c.unsupported = backoffEntry{delay: lo.Ternary(c.unsupported.delay == 0, unsupportedBackoff, min(c.unsupported.delay*2, maxUnsupportedBackoff))}
+			c.unsupported.next = c.clk.Now().Add(c.unsupported.delay)
+			log.FromContext(ctx).WithValues("retry-after", c.unsupported.delay).Info("EC2 doesn't support re-targeting running instances at capacity reservations in this region yet, pausing migration")
+			return calls, errs
+		}
 		if err == nil {
+			c.unsupported = backoffEntry{}
 			p.hold(target, inst.ID)
 			c.crProvider.SetPendingMigrations(p.pending)
 			delete(c.backoff, inst.ID)
@@ -803,6 +820,12 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 		}
 	}
 	return calls, errs
+}
+
+// unsupportedInRegion reports whether EC2 refused to re-target a running instance because the Region only allows stopped ones.
+func unsupportedInRegion(err error) bool {
+	apiErr, ok := lo.ErrorsAs[smithy.APIError](err)
+	return ok && apiErr.ErrorCode() == "IncorrectInstanceState" && strings.Contains(apiErr.ErrorMessage(), "allowed state: stopped")
 }
 
 // ambiguous reports whether a failed Modify may still have been applied by EC2.

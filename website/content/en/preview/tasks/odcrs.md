@@ -129,6 +129,7 @@ Karpenter will begin draining nodes launched for IODCRs when the 2-minute interr
 With the `ReservedCapacityMigration` [AWS feature gate]({{<ref "../reference/settings#aws-specific-feature-gates" >}}) enabled, Karpenter moves running nodes into a capacity reservation without replacing them.
 It uses [ModifyInstanceCapacityReservationAttributes](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyInstanceCapacityReservationAttributes.html), which needs the `ec2:ModifyInstanceCapacityReservationAttributes` permission on the controller role.
 The gate has no effect without the `ReservedCapacity` feature gate.
+In Regions where EC2 doesn't yet support re-targeting running instances, migration stays idle: Karpenter logs it once and retries after an hour, backing off to six hours.
 
 Karpenter considers two kinds of nodes:
 - on-demand nodes that don't target any capacity reservation
