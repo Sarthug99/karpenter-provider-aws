@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/disruption"
 	"sigs.k8s.io/karpenter/pkg/events"
 	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
@@ -344,6 +345,9 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(labels).To(HaveKeyWithValue(corecloudprovider.ReservationIDLabel, id))
 			Expect(labels).To(HaveKeyWithValue(v1.LabelCapacityReservationType, string(v1.CapacityReservationTypeDefault)))
 			Expect(labels).To(HaveKeyWithValue(v1.LabelCapacityReservationInterruptible, "false"))
+			for label := range corecloudprovider.ReservedCapacityLabels {
+				Expect(labels).To(HaveKey(label))
+			}
 		}
 	}
 
@@ -1606,5 +1610,33 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Expect(recorder.Calls(migration.EventReasonFailed)).To(Equal(0))
 			Expect(ExpectExists(ctx, env.Client, nc).Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationTarget))
 		})
+	})
+	It("should not drift a reserved NodeClaim InstanceTypeNotFound when its reservation leaves the EC2NodeClass before demotion", func() {
+		nodePool.Spec.Template.Spec.NodeClassRef = &karpv1.NodeClassReference{Group: object.GVK(nodeClass).Group, Kind: object.GVK(nodeClass).Kind, Name: nodeClass.Name}
+		ExpectApplied(ctx, env.Client, nodePool)
+		Expect(awsEnv.InstanceTypesProvider.UpdateInstanceTypes(ctx)).To(Succeed())
+		Expect(awsEnv.InstanceTypesProvider.UpdateInstanceTypeOfferings(ctx)).To(Succeed())
+		nodeClass.Spec.CapacityReservationSelectorTerms = nil
+		nodeClass.Status.CapacityReservations = nil
+		ExpectApplied(ctx, env.Client, nodeClass)
+		nc, _, _ := makeNode(nodeOpts{instance: func(i *ec2types.Instance) {
+			i.SubnetId = lo.ToPtr("subnet-test1")
+			i.SecurityGroups = []ec2types.GroupIdentifier{{GroupId: lo.ToPtr("sg-test1")}, {GroupId: lo.ToPtr("sg-test2")}, {GroupId: lo.ToPtr("sg-test3")}}
+		}, nodeClaim: func(nc *karpv1.NodeClaim) {
+			nc.Status.ImageID = "ami-test1"
+			nc.Labels = lo.Assign(nc.Labels, map[string]string{
+				karpv1.CapacityTypeLabelKey:              karpv1.CapacityTypeReserved,
+				corecloudprovider.ReservationIDLabel:     "cr-1",
+				v1.LabelCapacityReservationType:          string(v1.CapacityReservationTypeDefault),
+				v1.LabelCapacityReservationInterruptible: "false",
+			})
+		}})
+		awsEnv.Clock.Step(2 * time.Hour)
+		_, err := disruption.NewController(awsEnv.Clock, env.Client, cloudProvider).Reconcile(ctx, ExpectExists(ctx, env.Client, nc))
+		Expect(err).ToNot(HaveOccurred())
+		drifted := ExpectExists(ctx, env.Client, nc).StatusConditions().Get(karpv1.ConditionTypeDrifted)
+		if drifted != nil {
+			Expect(drifted.Reason).ToNot(Equal("InstanceTypeNotFound"))
+		}
 	})
 })

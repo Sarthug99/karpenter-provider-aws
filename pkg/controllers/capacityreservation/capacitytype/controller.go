@@ -118,7 +118,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	return reconciler.Result{RequeueAfter: time.Minute}, nil
 }
 
-var reservedLabelKeys = []string{karpv1.CapacityTypeLabelKey, cloudprovider.ReservationIDLabel, v1.LabelCapacityReservationType, v1.LabelCapacityReservationInterruptible}
+var reservedLabelKeys = append(cloudprovider.ReservedCapacityLabels.UnsortedList(), karpv1.CapacityTypeLabelKey)
 
 // promote finishes migrations whose controller is off and syncs a reserved NodeClaim's Nodes; other coverage stays on-demand.
 //
@@ -262,6 +262,4 @@ func demote(labels map[string]string) {
 	for label := range cloudprovider.ReservedCapacityLabels {
 		delete(labels, label)
 	}
-	// On-demand offerings require this label to be absent, so leaving it would cause InstanceTypeNotFound drift.
-	delete(labels, v1.LabelCapacityReservationInterruptible)
 }
