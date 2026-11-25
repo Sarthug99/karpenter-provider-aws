@@ -587,7 +587,8 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	}
 
 	nodeClass, err := c.nodeClass(ctx, p, nc)
-	if err != nil || nodeClass == nil {
+	// Launches treat a deleting EC2NodeClass as gone, so don't spend reservation slots on its nodes.
+	if err != nil || nodeClass == nil || !nodeClass.DeletionTimestamp.IsZero() {
 		return nil, err
 	}
 	reservations, endTimes, err := c.compatibleReservations(ctx, p, nodeClass, inst, state.TargetID)

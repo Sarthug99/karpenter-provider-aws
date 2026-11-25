@@ -1011,6 +1011,15 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 			Entry("missing from EC2", func(r *ec2types.CapacityReservation) { r.State = ec2types.CapacityReservationStateCancelled }, nil, "no_compatible_cr"),
 			Entry("expiring", func(*ec2types.CapacityReservation) {}, func(s *v1.CapacityReservation) { s.State = v1.CapacityReservationStateExpiring }, "no_compatible_cr"),
 		)
+		It("should skip nodes of a deleting EC2NodeClass", func() {
+			setReservations([]ec2types.CapacityReservation{cr}, cr)
+			nodeClass.Finalizers = []string{karpv1.TerminationFinalizer}
+			ExpectApplied(ctx, env.Client, nodeClass)
+			Expect(env.Client.Delete(ctx, nodeClass)).To(Succeed())
+			makeNode()
+			expectNoMigration()
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClass)
+		})
 		It("should skip instances with an unknown platform", func() {
 			setReservations([]ec2types.CapacityReservation{cr}, cr)
 			makeNode(nodeOpts{instance: func(i *ec2types.Instance) { i.PlatformDetails = nil }})
