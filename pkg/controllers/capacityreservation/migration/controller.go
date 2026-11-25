@@ -320,7 +320,7 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 		if !ok {
 			return true, c.holdUncovered(ctx, p, nc, inst)
 		}
-		if err := c.setTarget(ctx, nc, state.TargetID); err != nil {
+		if err := c.setTarget(ctx, nc, state.TargetID, state.CoveringID != state.TargetID); err != nil {
 			return false, err
 		}
 		target = state.TargetID
@@ -342,7 +342,7 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 		if !ok {
 			return true, multierr.Combine(c.holdUncovered(ctx, p, nc, inst), c.clearTarget(ctx, nc))
 		}
-		if err := c.setTarget(ctx, nc, state.TargetID); err != nil {
+		if err := c.setTarget(ctx, nc, state.TargetID, state.CoveringID != state.TargetID); err != nil {
 			return false, err
 		}
 		target = state.TargetID
@@ -496,10 +496,10 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		c.crProvider.MarkMigrated(target, inst.ID, c.uncovered[inst.ID])
 		MigrationCoverageDurationSeconds.Observe(c.clk.Since(t).Seconds(), map[string]string{})
 		MigrationCompletedTotal.Inc(map[string]string{caseLabel.Name: lo.ValueOr(c.cases, inst.ID, caseOnDemand)})
+		c.recorder.Publish(completedEvent(nc, target))
 	}
 	delete(c.cases, inst.ID)
 	delete(c.uncovered, inst.ID)
-	c.recorder.Publish(completedEvent(nc, target))
 	log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Info("migrated node into capacity reservation")
 	return nil
 }
@@ -738,7 +738,7 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 		}
 		target := lo.MinBy(reservations, func(a, b string) bool { return preferred(a, b, cand.endTimes, budgets) })
 		// Record intent first so a crash after the call still leaves durable state for the ledger.
-		if err := c.setTarget(ctx, nc, target); err != nil {
+		if err := c.setTarget(ctx, nc, target, true); err != nil {
 			errs = append(errs, client.IgnoreNotFound(serrors.Wrap(err, "NodeClaim", klog.KObj(nc))))
 			continue
 		}
@@ -938,12 +938,15 @@ func (c *Controller) pruneDenials(instances map[string]*instance.Instance) {
 	}
 }
 
-func (c *Controller) setTarget(ctx context.Context, nc *karpv1.NodeClaim, target string) error {
+// setTarget records target; requested-at marks a move still waiting for coverage, so an already-covered adoption omits it.
+func (c *Controller) setTarget(ctx context.Context, nc *karpv1.NodeClaim, target string, pending bool) error {
 	stored := nc.DeepCopy()
-	nc.Annotations = lo.Assign(nc.Annotations, map[string]string{
-		v1.AnnotationCapacityReservationMigrationTarget:      target,
-		v1.AnnotationCapacityReservationMigrationRequestedAt: c.clk.Now().UTC().Format(time.RFC3339),
-	})
+	nc.Annotations = lo.Assign(nc.Annotations, map[string]string{v1.AnnotationCapacityReservationMigrationTarget: target})
+	if pending {
+		nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt] = c.clk.Now().UTC().Format(time.RFC3339)
+	} else {
+		delete(nc.Annotations, v1.AnnotationCapacityReservationMigrationRequestedAt)
+	}
 	if err := c.kubeClient.Patch(ctx, nc, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 		return fmt.Errorf("annotating nodeclaim, %w", err)
 	}

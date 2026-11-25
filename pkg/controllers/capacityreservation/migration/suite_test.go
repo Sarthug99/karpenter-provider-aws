@@ -1191,6 +1191,29 @@ var _ = Describe("Capacity Reservation Migration Controller", func() {
 	})
 
 	Context("Adoption", func() {
+		It("should relabel an already-covered instance without counting it as a migration", func() {
+			migration.MigrationCompletedTotal.Reset()
+			cr := reservation("cr-1", 2)
+			setReservations([]ec2types.CapacityReservation{cr}, cr)
+			_, err := awsEnv.CapacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: "cr-1"})
+			Expect(err).ToNot(HaveOccurred())
+			// A launched reserved node demoted by stale data, so EC2's count already includes it.
+			nc, node, _ := makeNode(nodeOpts{instance: func(i *ec2types.Instance) {
+				i.CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+					CapacityReservationPreference: ec2types.CapacityReservationPreferenceCapacityReservationsOnly,
+					CapacityReservationTarget:     &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr("cr-1")},
+				}
+				i.CapacityReservationId = lo.ToPtr("cr-1")
+			}})
+			ExpectSingletonReconciled(ctx, controller)
+			Expect(modifyCalls()).To(Equal(0))
+			expectReserved(nc, node, "cr-1")
+			Expect(ExpectExists(ctx, env.Client, nc).Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationRequestedAt))
+			Expect(recorder.Calls(migration.EventReasonCompleted)).To(Equal(0))
+			_, found := FindMetricWithLabelValues("karpenter_capacity_reservation_migration_completed_total", map[string]string{})
+			Expect(found).To(BeFalse())
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount("cr-1")).To(Equal(2))
+		})
 		It("should not adopt an instance targeting a reservation it wouldn't choose", func() {
 			block := reservation("cr-block", 2, func(r *ec2types.CapacityReservation) {
 				r.ReservationType = ec2types.CapacityReservationTypeCapacityBlock
