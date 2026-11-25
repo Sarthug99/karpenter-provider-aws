@@ -1559,7 +1559,7 @@ var _ = Describe("CloudProvider", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(isDrifted).To(Equal(corecloudprovider.DriftReason("")))
 		})
-		It("should not drift a capacity-reservations-only instance labeled on-demand when an unselected reservation covers it", func() {
+		It("should drift a capacity-reservations-only instance labeled on-demand in an unselected reservation only without a migration target", func() {
 			// An orphaned node, relabeled on-demand, re-targeted in place at a reservation that then left the EC2NodeClass.
 			out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
 			out.Reservations[0].Instances[0].SpotInstanceRequestId = nil
@@ -1571,9 +1571,17 @@ var _ = Describe("CloudProvider", func() {
 			awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(out)
 			awsEnv.InstanceCache.Flush()
 			nodeClaim.Labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeOnDemand
+			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.AnnotationCapacityReservationMigrationTarget: "cr-bar"})
 			isDrifted, err := cloudProvider.IsDrifted(ctx, nodeClaim)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(isDrifted).To(Equal(corecloudprovider.DriftReason("")))
+
+			// Without the migration marker it is a launched reserved node demoted while covered, which can't be promoted again.
+			delete(nodeClaim.Annotations, v1.AnnotationCapacityReservationMigrationTarget)
+			awsEnv.InstanceCache.Flush()
+			isDrifted, err = cloudProvider.IsDrifted(ctx, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isDrifted).To(Equal(cloudprovider.CapacityReservationDrift))
 
 			nodeClaim.Labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeReserved
 			awsEnv.InstanceCache.Flush()

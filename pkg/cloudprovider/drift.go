@@ -146,8 +146,9 @@ func (c *CloudProvider) isCapacityReservationDrifted(ctx context.Context, nodeCl
 		if i.CapacityReservationDetails == nil || capacityReservationIDs.Has(i.CapacityReservationDetails.ID) {
 			return false
 		}
-		// A node labeled on-demand, or re-targeted in place and not yet labeled reserved, counts as on-demand, so it can't drift.
-		if nodeClaim.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeOnDemand {
+		// A node re-targeted in place and not yet labeled reserved counts as on-demand; a demoted launched node still drifts.
+		if nodeClaim.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeOnDemand &&
+			nodeClaim.Annotations[v1.AnnotationCapacityReservationMigrationTarget] == i.CapacityReservationDetails.ID {
 			return false
 		}
 		return i.CapacityReservationState.Preference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly ||
