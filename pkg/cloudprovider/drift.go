@@ -165,18 +165,23 @@ func (c *CloudProvider) isCapacityReservationDrifted(ctx context.Context, nodeCl
 	if !drifted(i) {
 		return "", nil
 	}
-	if i.CapacityReservationState.Preference != ec2types.CapacityReservationPreferenceCapacityReservationsOnly ||
-		nodeClaim.Annotations[v1.AnnotationCapacityReservationMigrationTarget] == i.CapacityReservationDetails.ID {
-		// A re-targeted node whose reservation passed its EndDate moves again once EC2 ends it; only a live, unselected one drifts.
-		reservations, err := c.capacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: i.CapacityReservationDetails.ID})
-		if err != nil {
-			return "", fmt.Errorf("getting capacity reservation, %w", err)
-		}
-		if len(reservations) == 0 {
-			return "", nil
-		}
+	if ended, err := c.retargetedPastEndDate(ctx, nodeClaim, i); err != nil || ended {
+		return "", err
 	}
 	return CapacityReservationDrift, nil
+}
+
+// retargetedPastEndDate reports whether a re-targeted node's reservation passed its EndDate; it moves again once EC2 ends it.
+func (c *CloudProvider) retargetedPastEndDate(ctx context.Context, nodeClaim *karpv1.NodeClaim, i *instance.Instance) (bool, error) {
+	if i.CapacityReservationState.Preference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly &&
+		nodeClaim.Annotations[v1.AnnotationCapacityReservationMigrationTarget] != i.CapacityReservationDetails.ID {
+		return false, nil
+	}
+	reservations, err := c.capacityReservationProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: i.CapacityReservationDetails.ID})
+	if err != nil {
+		return false, fmt.Errorf("getting capacity reservation, %w", err)
+	}
+	return len(reservations) == 0, nil
 }
 
 // isPlacementGroupDrifted checks if the node's placement group ID label no longer matches the EC2NodeClass's
