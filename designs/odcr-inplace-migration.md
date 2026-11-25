@@ -62,7 +62,7 @@ sequenceDiagram
   participant EC2
   participant CT as capacitytype
   M->>EC2: Modify(i-1, target cr-A)
-  EC2-->>M: ok, covered (<1s live)
+  EC2-->>M: ok, covered (seconds; up to ~8 min live)
   M->>M: next pass: relabel reserved/cr-A
   Note over EC2: cr-A cancelled
   CT->>CT: uncovered → relabel on-demand
@@ -73,8 +73,8 @@ sequenceDiagram
 ## Design Details
 
 - **State:** two annotations, `karpenter.k8s.aws/capacity-reservation-migration-target` and `-requested-at`. They make the controller restart-safe. The target stays after completion as a marker, so a demotion from stale EC2 data is relabeled again. EC2's view of the instance is the source of truth.
-- **No double-booking:** pending migrations hold slots in the reservation cache, so neither the provisioner nor a second migration takes them. A covered node stays held until a sync whose API call *started* after coverage, at most 15m, or until the count is forced from EC2 (`SetAvailableInstanceCount`). A pending node stops holding its slot after the 30m stall threshold. Migration also leaves slots for reserved NodeClaims that haven't launched (one per offered ODCR).
-- **Classification and labels:** an instance whose target equals its covering ODCR is `reserved`, independent of the `ReservedCapacityMigration` gate. Labels follow EC2: once covered by a selected ODCR, the node is labeled `reserved` even if a pod or the NodePool started rejecting it while pending (`Incompatible` event; requirement drift handles the NodePool case). If the gate is turned off while a move is pending, the capacitytype controller completes it from the target annotation, so Delete returns the slot to the right ODCR; it never relabels re-targets the migration controller didn't start. Coverage by an unselected ODCR stays `on-demand`, as with open matching, so it can't cause `CapacityReservationDrift`.
+- **No double-booking:** pending migrations hold slots in the reservation cache, so neither the provisioner nor a second migration takes them. A covered node stays held until a sync whose API call *started* after the last pass that saw it uncovered (none if one already did), at most 15m, or until the count is forced from EC2 (`SetAvailableInstanceCount`). Every hold, including draining and out-of-band ones, ends after the 30m stall threshold or once EC2 targets another ODCR. Migration also leaves slots for reserved NodeClaims that haven't launched (one per offered ODCR).
+- **Classification and labels:** an instance whose target equals its covering ODCR is `reserved`, independent of the `ReservedCapacityMigration` gate. Labels follow EC2: once covered by a selected ODCR, the node is labeled `reserved` even if a pod or the NodePool started rejecting it while pending (`Incompatible` event; requirement drift handles the NodePool case). If the gate is turned off while a move is pending, the capacitytype controller completes it from the target annotation, so Delete returns the slot to the right ODCR; it never relabels re-targets the migration controller didn't start. Coverage by an unselected ODCR stays `on-demand`, as with open matching, so it can't cause `CapacityReservationDrift` unless EC2 reports `capacity-reservations-only` and there's no migration marker. An adoption already covered isn't counted as a migration (no hold, metrics or `Completed` event).
 - **Target choice:** ODCRs ending within 1h are skipped (coverage can take up to the 30m stall threshold); then no end date, latest end, most free slots, lowest ID.
 - **Errors:** client errors such as `IncorrectInstanceState` or `RequestExpired` are definite: clear the annotation, back off. `UnauthorizedOperation` backs off that instance for that ODCR (5m doubling to 1h), and the whole ODCR for 5m once a second instance is denied, since the shipped policy scopes the permission by instance tags. 5xx, timeouts and resets are ambiguous: keep the annotation and hold, back off, and end the pass. After a crash between the annotation and the call, the call is re-issued only after a 5m visibility grace. A node that stays pending past 30m gets a `Stalled` event and releases its hold. Instances in a zonally shifted AZ are skipped before annotating.
 - **IAM:** `ec2:ModifyInstanceCapacityReservationAttributes`, scoped to instances tagged with the cluster and a NodePool. The getting-started CloudFormation template and docs are updated.
@@ -86,7 +86,7 @@ sequenceDiagram
 | Availability | None: no drain, replacement or restart (live: same boot ID and pod UIDs). |
 | Cost | Idle ODCR slots are absorbed by running on-demand nodes, raising ODCR utilization and cutting on-demand spend. |
 | Capacity | Existing nodes take free slots before new launches. A pod that would have used the slot launches on-demand with the same instance type. |
-| One-way | A migrated instance stays pinned to its ODCR until replaced. If that ODCR ends, the node becomes case (b) and moves again. |
+| One-way | A migrated instance stays pinned to its ODCR until replaced. If that ODCR ends, the node becomes case (b) and moves again; past a limited EndDate it isn't drifted while EC2 still covers it. |
 | Labels | `capacity-type` flips `on-demand` → `reserved` on a running node. Pods that later require on-demand won't schedule there. |
 | Observability | Metrics `karpenter_capacity_reservation_migration_{attempts_total{case,result}, completed_total{case}, pending, stalled, ineligible{reason}, coverage_duration_seconds}`. NodeClaim events `CapacityReservationMigration{Started,Completed,Failed,Stalled,NotRelabeled,Incompatible}`. Ineligibility is a gauge, not events, to avoid spam. |
 
@@ -97,10 +97,11 @@ sequenceDiagram
 | Provisioning | Holds shrink the reserved offerings the scheduler sees, avoiding `ReservedCapacityExceeded`. Migration and new launches compete for the same slot; first one wins. |
 | Consolidation | A migrated node is priced as reserved (≈$0), so consolidation stops replacing it and may pack pods onto it. Nodes tainted `karpenter.sh/disrupted` are skipped. |
 | Drift | Targets come only from NodeClass status, so `CapacityReservationDrift` stays false. **Gotcha (D5):** in a reserved-only NodePool, an orphaned node is relabeled on-demand and may be replaced by requirement drift before migration (1m) saves it. |
-| capacitytype controller | Lists NodeClaims before instances, so a stale snapshot can't undo a fresh relabel. Also completes annotated moves when the gate is off, keeps Node labels in line with their NodeClaim, and strips the interruptible label on demotion. |
+| capacitytype controller | Lists NodeClaims before instances, so a stale snapshot can't undo a fresh relabel. Also completes annotated moves when the gate is off, keeps Node labels in line with their NodeClaim. The interruptible label is a reserved-capacity label, so demotion and core `InstanceTypeNotFound` drift ignore it. |
 | Rollback | Versions without the target-equals-covering classification demote migrated nodes but keep `interruptible=false`, so `InstanceTypeNotFound` drift replaces them in any NodePool, and DaemonSets requiring `reserved` lose pods. Documented with a workaround; backporting is a follow-up. |
 | Expiration | Only Capacity Blocks near their end are deleted, and they're never migration targets. |
 | DRA | Unchanged. Only labels change; devices and ResourceSlices are untouched. |
+| Scheduling | Only pods already bound are checked. A DaemonSet or pending pod whose required affinity matches only after the relabel can preempt pods on a full node or stay Pending. Documented. |
 | Spot / open / Capacity Block / interruptible | Never migrated. EC2 also rejects open → target, and Capacity Block or interruptible targets. |
 
 ## Testing
