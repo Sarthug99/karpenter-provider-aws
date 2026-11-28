@@ -1504,6 +1504,122 @@ var _ = Describe("CloudProvider", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(isDrifted).To(Equal(cloudprovider.CapacityReservationDrift))
 		})
+		It("should only drift an in-place re-targeted instance once its NodeClaim is labeled with the reservation", func() {
+			migrationCtx := options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacityMigration: lo.ToPtr(true)}}))
+			out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
+			out.Reservations[0].Instances[0].SpotInstanceRequestId = nil
+			out.Reservations[0].Instances[0].CapacityReservationId = lo.ToPtr("cr-bar")
+			out.Reservations[0].Instances[0].CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+				CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr("cr-bar")},
+			}
+			awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(out)
+			awsEnv.InstanceCache.Flush()
+			awsEnv.EC2API.DescribeCapacityReservationsOutput.Set(&ec2.DescribeCapacityReservationsOutput{CapacityReservations: []ec2types.CapacityReservation{{
+				CapacityReservationId: lo.ToPtr("cr-bar"), OwnerId: lo.ToPtr("012345678901"), AvailableInstanceCount: lo.ToPtr[int32](1), State: ec2types.CapacityReservationStateActive,
+			}}})
+			isDrifted, err := cloudProvider.IsDrifted(migrationCtx, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isDrifted).To(Equal(corecloudprovider.DriftReason("")))
+
+			nodeClaim.Labels[corecloudprovider.ReservationIDLabel] = "cr-bar"
+			awsEnv.InstanceCache.Flush()
+			isDrifted, err = cloudProvider.IsDrifted(migrationCtx, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isDrifted).To(Equal(cloudprovider.CapacityReservationDrift))
+		})
+		It("should not drift a re-targeted instance whose reservation passed its EndDate while EC2 still covers it", func() {
+			endDate := awsEnv.Clock.Now().Add(10 * time.Minute)
+			awsEnv.EC2API.DescribeCapacityReservationsOutput.Set(&ec2.DescribeCapacityReservationsOutput{CapacityReservations: []ec2types.CapacityReservation{{
+				CapacityReservationId: lo.ToPtr("cr-limited"), OwnerId: lo.ToPtr("012345678901"), AvailableInstanceCount: lo.ToPtr[int32](1), State: ec2types.CapacityReservationStateActive,
+				EndDate: lo.ToPtr(endDate), EndDateType: ec2types.EndDateTypeLimited,
+			}}})
+			out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
+			out.Reservations[0].Instances[0].SpotInstanceRequestId = nil
+			out.Reservations[0].Instances[0].CapacityReservationId = lo.ToPtr("cr-limited")
+			out.Reservations[0].Instances[0].CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+				CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr("cr-limited")},
+			}
+			awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(out)
+			awsEnv.InstanceCache.Flush()
+			nodeClaim.Labels = lo.Assign(nodeClaim.Labels, map[string]string{
+				karpv1.CapacityTypeLabelKey:              karpv1.CapacityTypeReserved,
+				corecloudprovider.ReservationIDLabel:     "cr-limited",
+				v1.LabelCapacityReservationType:          string(v1.CapacityReservationTypeDefault),
+				v1.LabelCapacityReservationInterruptible: "false",
+			})
+			// Deselected while live: replaced like a launched reserved node.
+			isDrifted, err := cloudProvider.IsDrifted(ctx, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isDrifted).To(Equal(cloudprovider.CapacityReservationDrift))
+
+			// Past its EndDate the reservation leaves the EC2NodeClass status, but EC2 ends it up to an hour later.
+			awsEnv.Clock.Step(11 * time.Minute)
+			awsEnv.InstanceCache.Flush()
+			isDrifted, err = cloudProvider.IsDrifted(ctx, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isDrifted).To(Equal(corecloudprovider.DriftReason("")))
+		})
+		DescribeTable("should drift a re-targeted instance in a deselected reservation when its EndDate can't be read",
+			func(fail bool) {
+				awsEnv.EC2API.DescribeCapacityReservationsOutput.Set(&ec2.DescribeCapacityReservationsOutput{CapacityReservations: lo.Ternary(fail, []ec2types.CapacityReservation{{
+					CapacityReservationId: lo.ToPtr("cr-limited"), OwnerId: lo.ToPtr("012345678901"), AvailableInstanceCount: lo.ToPtr[int32](1), State: ec2types.CapacityReservationStateActive,
+					EndDate: lo.ToPtr(awsEnv.Clock.Now().Add(-time.Minute)), EndDateType: ec2types.EndDateTypeLimited,
+				}}, nil)})
+				awsEnv.CapacityReservationCache.Flush()
+				out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
+				out.Reservations[0].Instances[0].SpotInstanceRequestId = nil
+				out.Reservations[0].Instances[0].CapacityReservationId = lo.ToPtr("cr-limited")
+				out.Reservations[0].Instances[0].CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+					CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr("cr-limited")},
+				}
+				awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(out)
+				awsEnv.InstanceCache.Flush()
+				nodeClaim.Labels = lo.Assign(nodeClaim.Labels, map[string]string{
+					karpv1.CapacityTypeLabelKey:              karpv1.CapacityTypeReserved,
+					corecloudprovider.ReservationIDLabel:     "cr-limited",
+					v1.LabelCapacityReservationType:          string(v1.CapacityReservationTypeDefault),
+					v1.LabelCapacityReservationInterruptible: "false",
+				})
+				if fail {
+					awsEnv.EC2API.NextError.Set(&smithy.GenericAPIError{Code: "RequestLimitExceeded"})
+				}
+				isDrifted, err := cloudProvider.IsDrifted(ctx, nodeClaim)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(isDrifted).To(Equal(cloudprovider.CapacityReservationDrift))
+			},
+			Entry("EC2 doesn't return it, e.g. an unshared reservation", false),
+			Entry("the lookup fails", true),
+		)
+		It("should drift a capacity-reservations-only instance labeled on-demand in an unselected reservation only without a migration target", func() {
+			// An orphaned node, relabeled on-demand, re-targeted in place at a reservation that then left the EC2NodeClass.
+			out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
+			out.Reservations[0].Instances[0].SpotInstanceRequestId = nil
+			out.Reservations[0].Instances[0].CapacityReservationId = lo.ToPtr("cr-bar")
+			out.Reservations[0].Instances[0].CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+				CapacityReservationPreference: ec2types.CapacityReservationPreferenceCapacityReservationsOnly,
+				CapacityReservationTarget:     &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr("cr-bar")},
+			}
+			awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(out)
+			awsEnv.InstanceCache.Flush()
+			nodeClaim.Labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeOnDemand
+			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.AnnotationCapacityReservationMigrationTarget: "cr-bar"})
+			isDrifted, err := cloudProvider.IsDrifted(ctx, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isDrifted).To(Equal(corecloudprovider.DriftReason("")))
+
+			// Without the migration marker it is a launched reserved node demoted while covered, which can't be promoted again.
+			delete(nodeClaim.Annotations, v1.AnnotationCapacityReservationMigrationTarget)
+			awsEnv.InstanceCache.Flush()
+			isDrifted, err = cloudProvider.IsDrifted(ctx, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isDrifted).To(Equal(cloudprovider.CapacityReservationDrift))
+
+			nodeClaim.Labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeReserved
+			awsEnv.InstanceCache.Flush()
+			isDrifted, err = cloudProvider.IsDrifted(ctx, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isDrifted).To(Equal(cloudprovider.CapacityReservationDrift))
+		})
 		It("should not drift when capacity reservation falls back to on-demand", func() {
 			// Reflect capacity reservation and in the instance
 			nodeClass.Status.CapacityReservations = []v1.CapacityReservation{

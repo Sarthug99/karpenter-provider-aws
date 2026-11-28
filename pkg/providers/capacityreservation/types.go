@@ -24,6 +24,7 @@ import (
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/clock"
 
 	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
@@ -112,22 +113,87 @@ type availabilityCache struct {
 	availabilityCache *cache.Cache
 	terminationCache  *cache.Cache // instance IDs whose slot was already returned
 	clk               clock.Clock
+	// EC2's AvailableInstanceCount lags in-place migrations, so these slots are held until a later sync includes them.
+	pendingMigrations map[string]sets.Set[string]     // reservation ID -> re-targeted, uncovered instance IDs
+	migrated          map[string]map[string]time.Time // reservation ID -> covered instance ID -> time known to follow coverage
 }
 
 type availabilityCacheEntry struct {
-	count    int
-	syncTime time.Time
+	count       int
+	syncTime    time.Time
+	requestedAt time.Time
 }
 
-func (c *availabilityCache) syncAvailability(availability map[string]int) {
+// syncAvailability stores counts read by a DescribeCapacityReservations call issued at requestedAt.
+func (c *availabilityCache) syncAvailability(availability map[string]int, requestedAt time.Time) {
 	now := c.clk.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for id, count := range availability {
 		c.availabilityCache.SetDefault(id, &availabilityCacheEntry{
-			count:    count,
-			syncTime: now,
+			count:       count,
+			syncTime:    now,
+			requestedAt: requestedAt,
 		})
+		for instanceID, coveredAt := range c.migrated[id] {
+			// A read issued before coverage may not count the instance yet.
+			if coveredAt.Before(requestedAt) {
+				delete(c.migrated[id], instanceID)
+			}
+		}
+		if len(c.migrated[id]) == 0 {
+			delete(c.migrated, id)
+		}
+	}
+	// Holds for reservations no sync returns, e.g. ones no longer selected, would otherwise never be freed.
+	for id, instances := range c.migrated {
+		for instanceID, coveredAt := range instances {
+			if now.Sub(coveredAt) > terminatedInstanceTTL {
+				delete(instances, instanceID)
+			}
+		}
+		if len(instances) == 0 {
+			delete(c.migrated, id)
+		}
+	}
+}
+
+func (c *availabilityCache) SetPendingMigrations(pending map[string]sets.Set[string]) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pendingMigrations = map[string]sets.Set[string]{}
+	for id, instanceIDs := range pending {
+		if instanceIDs.Len() != 0 {
+			c.pendingMigrations[id] = instanceIDs.Clone()
+		}
+	}
+}
+
+// ResetMigrations clears the migration ledger; tests use it between cases.
+func (c *availabilityCache) ResetMigrations() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pendingMigrations = map[string]sets.Set[string]{}
+	c.migrated = map[string]map[string]time.Time{}
+}
+
+func (c *availabilityCache) MarkMigrated(reservationID, instanceID string, observedAt time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if observedAt.IsZero() {
+		observedAt = c.clk.Now()
+	}
+	if entry, ok := c.availabilityCache.Get(reservationID); ok && entry.(*availabilityCacheEntry).requestedAt.After(observedAt) {
+		return
+	}
+	if c.migrated == nil {
+		c.migrated = map[string]map[string]time.Time{}
+	}
+	if _, ok := c.migrated[reservationID]; !ok {
+		c.migrated[reservationID] = map[string]time.Time{}
+	}
+	if _, ok := c.migrated[reservationID][instanceID]; !ok {
+		c.migrated[reservationID][instanceID] = observedAt
 	}
 }
 
@@ -177,7 +243,14 @@ func (c *availabilityCache) GetAvailableInstanceCount(reservationID string) int 
 	if !ok {
 		return 0
 	}
-	return entry.(*availabilityCacheEntry).count
+	held := c.pendingMigrations[reservationID].Len()
+	for instanceID := range c.migrated[reservationID] {
+		// Don't double count an instance that is both pending (stale annotation) and covered.
+		if !c.pendingMigrations[reservationID].Has(instanceID) {
+			held++
+		}
+	}
+	return max(0, entry.(*availabilityCacheEntry).count-held)
 }
 
 // SetAvailableInstanceCount forces the cached availability for a reservation. The launch path uses it to zero a
@@ -186,8 +259,11 @@ func (c *availabilityCache) GetAvailableInstanceCount(reservationID string) int 
 func (c *availabilityCache) SetAvailableInstanceCount(reservationID string, count int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// The forced count is EC2's current verdict, which already includes covered instances.
+	delete(c.migrated, reservationID)
 	c.availabilityCache.SetDefault(reservationID, &availabilityCacheEntry{
-		count:    count,
-		syncTime: c.clk.Now(),
+		count:       count,
+		syncTime:    c.clk.Now(),
+		requestedAt: c.clk.Now(),
 	})
 }

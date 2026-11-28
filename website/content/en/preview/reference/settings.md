@@ -13,7 +13,7 @@ Karpenter surfaces environment variables and CLI parameters to allow you to conf
 | Environment Variable | CLI Flag | Description |
 |--|--|--|
 | AMI_REFRESH_INTERVAL | \-\-ami-refresh-interval | How often Karpenter refreshes AMI data from EC2. Increasing this value will reduce the number of DescribeImages API calls at the cost of increased staleness in AMI discovery and drift detection. Must be at least 1m. (default = 1m0s)|
-| AWS_FEATURE_GATES | \-\-aws-feature-gates | Optional AWS-specific features can be enabled / disabled using feature gates. Current options are: NodeClassCEL, DRANVIDIAGPU, DRAEFA, RebootForRepair. (default = NodeClassCEL=false,DRANVIDIAGPU=false,DRAEFA=false,RebootForRepair=false)|
+| AWS_FEATURE_GATES | \-\-aws-feature-gates | Optional AWS-specific features can be enabled / disabled using feature gates. Current options are: NodeClassCEL, DRANVIDIAGPU, DRAEFA, RebootForRepair, ReservedCapacityMigration. (default = NodeClassCEL=false,DRANVIDIAGPU=false,DRAEFA=false,RebootForRepair=false,ReservedCapacityMigration=false)|
 | AWS_SDK_DEBUG_LOG | \-\-aws-sdk-debug-log | If true, then log AWS SDK requests, responses and retries, including bodies, under the aws-sdk logger. Credential headers are redacted, but bodies can contain sensitive data such as user data and the cluster CA bundle. Intended for troubleshooting only.|
 | BATCH_IDLE_DURATION | \-\-batch-idle-duration | The maximum amount of time with no new pending pods that if exceeded ends the current batching window. If pods arrive faster than this time, the batching window will be extended up to the maxDuration. If they arrive slower, the pods will be batched separately. (default = 1s)|
 | BATCH_MAX_DURATION | \-\-batch-max-duration | The maximum length of a batch window. The longer this is, the more pods we can consider for provisioning at one time which usually results in fewer but larger nodes. (default = 10s)|
@@ -111,12 +111,15 @@ Some features are specific to the AWS provider and are configured separately fro
 | DRANVIDIAGPU | false   | Alpha | v1.15.x  |       |
 | DRAEFA       | false   | Alpha | v1.15.x  |       |
 | RebootForRepair | false | Alpha | v1.15.x  |       |
+| ReservedCapacityMigration | false | Alpha | v1.16.x  |       |
 
 `NodeClassCEL` enables [CEL expression support in `spec.kubelet`]({{<ref "../concepts/nodeclasses#dynamic-kubelet-configuration-via-expressions" >}}), allowing `maxPods`, `kubeReserved`, and `systemReserved` to be configured as per-instance-type expressions.
 
 `DRANVIDIAGPU` and `DRAEFA` make Karpenter calculate the DRA devices the NVIDIA GPU driver (`gpu.nvidia.com`) and the dranet driver's EFA interfaces (`dra.net`) publish, respectively, so that pods with ResourceClaims for those drivers are accounted for when it sizes new nodes. Each gate is independent of the other, and of the core `--ignore-dra-requests` option: both a driver's gate and `--ignore-dra-requests=false` are needed for Karpenter to contribute that driver's devices. When installing with the Helm chart, set `settings.enableDRA` to enable both gates and set `IGNORE_DRA_REQUESTS=false`. To enable the gates individually, leave `settings.enableDRA` unset and set `settings.awsFeatureGates.draNVIDIAGPU` or `settings.awsFeatureGates.draEFA`. Enabling either one also sets `IGNORE_DRA_REQUESTS=false`, regardless of `settings.ignoreDRARequests`. The chart fails to render if `settings.enableDRA` is combined with `settings.awsFeatureGates.draNVIDIAGPU`, `settings.awsFeatureGates.draEFA`, or `settings.ignoreDRARequests`. With a driver's gate disabled, its claims are only satisfied by devices the driver publishes on nodes that already exist.
 
 `RebootForRepair` makes [Node Auto Repair]({{<ref "../concepts/disruption#node-auto-repair" >}}) reboot a node in place for reboot-clearable GPU faults instead of replacing it. It has no effect without the `NodeRepair` feature gate. When it's disabled, those faults are replaced on the same toleration and termination grace period. Enabling it requires the `ec2:RebootInstances` permission on the controller role.
+
+`ReservedCapacityMigration` moves running on-demand nodes, and nodes whose capacity reservation expired or was cancelled, into a capacity reservation their EC2NodeClass selects, without replacing them. See [Migrating Running Nodes into Capacity Reservations]({{<ref "../tasks/odcrs#migrating-running-nodes-into-capacity-reservations" >}}). It has no effect without the `ReservedCapacity` feature gate. Enabling it requires the `ec2:ModifyInstanceCapacityReservationAttributes` permission on the controller role.
 
 ### Batching Parameters
 

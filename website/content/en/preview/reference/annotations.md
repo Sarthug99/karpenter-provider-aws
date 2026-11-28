@@ -73,6 +73,30 @@ Karpenter sets this once it has tagged the NodeClaim's EC2 instance with the eks
 Values:
 - `true` — The instance has the eks:eks-cluster-name tag.
 
+### `karpenter.k8s.aws/capacity-reservation-migration-requested-at`
+
+Type: Annotation
+
+Example: `karpenter.k8s.aws/capacity-reservation-migration-requested-at: "2024-01-01T00:00:00Z"`
+
+Used on: NodeClaim
+
+Stability Level: ALPHA
+
+With the ReservedCapacityMigration feature gate, Karpenter sets this to the RFC3339 time it re-targeted the NodeClaim's instance at a capacity reservation, to measure coverage lag.
+
+### `karpenter.k8s.aws/capacity-reservation-migration-target`
+
+Type: Annotation
+
+Example: `karpenter.k8s.aws/capacity-reservation-migration-target: "cr-56fac701cc1951b03"`
+
+Used on: NodeClaim
+
+Stability Level: ALPHA
+
+With the ReservedCapacityMigration feature gate, Karpenter sets this to the capacity reservation it re-targeted the NodeClaim's running instance at. It stays once EC2 reports the instance covered and the NodeClaim is relabeled reserved, so a demotion from stale EC2 data is relabeled again.
+
 ### `karpenter.k8s.aws/ec2nodeclass-hash`
 
 Type: Annotation

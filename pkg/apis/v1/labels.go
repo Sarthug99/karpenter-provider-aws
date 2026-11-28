@@ -184,6 +184,9 @@ var (
 	AnnotationInstanceProfile                = apis.Group + "/instance-profile-name"
 	AnnotationNVIDIAConsumableCapacity       = apis.Group + "/nvidia-consumable-capacity"
 
+	AnnotationCapacityReservationMigrationTarget      = apis.Group + "/capacity-reservation-migration-target"
+	AnnotationCapacityReservationMigrationRequestedAt = apis.Group + "/capacity-reservation-migration-requested-at"
+
 	NodeClaimTagKey          = coreapis.Group + "/nodeclaim"
 	NameTagKey               = "Name"
 	NodePoolTagKey           = karpv1.NodePoolLabelKey
@@ -247,6 +250,28 @@ var (
 	}
 )
 
+var (
+	CapacityReservationMigrationTargetAnnotation = wellknown.Annotation{
+		Name:    AnnotationCapacityReservationMigrationTarget,
+		Example: "cr-56fac701cc1951b03",
+		UsedOn:  []runtime.Object{&karpv1.NodeClaim{}},
+		Help: "With the ReservedCapacityMigration feature gate, Karpenter sets this to the capacity reservation it " +
+			"re-targeted the NodeClaim's running instance at. It stays once EC2 reports the instance covered and the " +
+			"NodeClaim is relabeled reserved, so a demotion from stale EC2 data is relabeled again.",
+		Stage:        docs.Alpha,
+		InternalOnly: true,
+	}
+	CapacityReservationMigrationRequestedAtAnnotation = wellknown.Annotation{
+		Name:    AnnotationCapacityReservationMigrationRequestedAt,
+		Example: "2024-01-01T00:00:00Z",
+		UsedOn:  []runtime.Object{&karpv1.NodeClaim{}},
+		Help: "With the ReservedCapacityMigration feature gate, Karpenter sets this to the RFC3339 time it " +
+			"re-targeted the NodeClaim's instance at a capacity reservation, to measure coverage lag.",
+		Stage:        docs.Alpha,
+		InternalOnly: true,
+	}
+)
+
 // AWSAnnotations are the well known annotations the AWS provider reads or writes.
 var AWSAnnotations = []wellknown.Annotation{
 	EC2NodeClassHashAnnotation,
@@ -254,4 +279,6 @@ var AWSAnnotations = []wellknown.Annotation{
 	InstanceTaggedAnnotation,
 	ClusterNameTaggedAnnotation,
 	InstanceProfileAnnotation,
+	CapacityReservationMigrationTargetAnnotation,
+	CapacityReservationMigrationRequestedAtAnnotation,
 }

@@ -24,6 +24,7 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
@@ -34,11 +35,18 @@ import (
 
 type Provider interface {
 	List(context.Context, ...v1.CapacityReservationSelectorTerm) ([]*ec2types.CapacityReservation, error)
+	// PastEndDate reports whether EC2 still lists the reservation as active after its EndDate, which it can for up to an hour.
+	PastEndDate(ctx context.Context, id string) (bool, error)
 	GetAvailableInstanceCount(string) int
 	SetAvailableInstanceCount(string, int)
 	MarkLaunched(string)
 	// MarkTerminated returns instanceID's slot to the reservation. Repeat calls for the same instance are no-ops.
 	MarkTerminated(reservationID, instanceID string)
+	// SetPendingMigrations replaces the set of instances re-targeted in place at each reservation but not yet covered.
+	SetPendingMigrations(map[string]sets.Set[string])
+	// MarkMigrated holds instanceID's slot against the reservation until an EC2 sync issued after observedAt, a time
+	// known to follow its coverage (zero for now), and skips the hold if such a sync already happened.
+	MarkMigrated(reservationID, instanceID string, observedAt time.Time)
 }
 
 type DefaultProvider struct {
@@ -61,6 +69,8 @@ func NewProvider(
 			availabilityCache: reservationAvailabilityCache,
 			terminationCache:  cache.New(terminatedInstanceTTL, time.Minute),
 			clk:               clk,
+			pendingMigrations: map[string]sets.Set[string]{},
+			migrated:          map[string]map[string]time.Time{},
 		},
 		ec2api:           ec2api,
 		clk:              clk,
@@ -70,6 +80,25 @@ func NewProvider(
 }
 
 func (p *DefaultProvider) List(ctx context.Context, selectorTerms ...v1.CapacityReservationSelectorTerm) ([]*ec2types.CapacityReservation, error) {
+	reservations, err := p.list(ctx, selectorTerms...)
+	if err != nil {
+		return nil, err
+	}
+	return p.filterReservations(reservations), nil
+}
+
+func (p *DefaultProvider) PastEndDate(ctx context.Context, id string) (bool, error) {
+	reservations, err := p.list(ctx, v1.CapacityReservationSelectorTerm{ID: id})
+	if err != nil {
+		return false, err
+	}
+	return lo.ContainsBy(reservations, func(r *ec2types.CapacityReservation) bool {
+		return lo.FromPtr(r.CapacityReservationId) == id && r.EndDate != nil && !r.EndDate.After(p.clk.Now())
+	}), nil
+}
+
+// list returns the active reservations the selector terms match, including any past their EndDate.
+func (p *DefaultProvider) list(ctx context.Context, selectorTerms ...v1.CapacityReservationSelectorTerm) ([]*ec2types.CapacityReservation, error) {
 	// Take a write lock over the entire List operation to ensure minimize duplicate DescribeCapacityReservation calls
 	p.Lock()
 	defer p.Unlock()
@@ -77,10 +106,8 @@ func (p *DefaultProvider) List(ctx context.Context, selectorTerms ...v1.Capacity
 	var reservations []*ec2types.CapacityReservation
 	queries := QueriesFromSelectorTerms(selectorTerms...)
 	reservations, queries = p.resolveCachedQueries(queries...)
-	if len(queries) == 0 {
-		return p.filterReservations(reservations), nil
-	}
 	for _, q := range queries {
+		requestedAt := p.clk.Now()
 		paginator := ec2.NewDescribeCapacityReservationsPaginator(p.ec2api, q.DescribeCapacityReservationsInput())
 		var queryReservations []*ec2types.CapacityReservation
 		for paginator.HasMorePages() {
@@ -97,11 +124,11 @@ func (p *DefaultProvider) List(ctx context.Context, selectorTerms ...v1.Capacity
 		}
 		p.syncAvailability(lo.SliceToMap(queryReservations, func(r *ec2types.CapacityReservation) (string, int) {
 			return *r.CapacityReservationId, int(*r.AvailableInstanceCount)
-		}))
+		}), requestedAt)
 		p.reservationCache.SetDefault(q.CacheKey(), queryReservations)
 		reservations = append(reservations, queryReservations...)
 	}
-	return p.filterReservations(reservations), nil
+	return reservations, nil
 }
 
 func (p *DefaultProvider) resolveCachedQueries(queries ...*Query) (reservations []*ec2types.CapacityReservation, remainingQueries []*Query) {

@@ -20,6 +20,7 @@ import (
 	"github.com/awslabs/operatorpkg/controller"
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/patrickmn/go-cache"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
@@ -33,6 +34,7 @@ import (
 	sdk "github.com/aws/karpenter-provider-aws/pkg/aws"
 	crcapacitytype "github.com/aws/karpenter-provider-aws/pkg/controllers/capacityreservation/capacitytype"
 	crexpiration "github.com/aws/karpenter-provider-aws/pkg/controllers/capacityreservation/expiration"
+	crmigration "github.com/aws/karpenter-provider-aws/pkg/controllers/capacityreservation/migration"
 	instancestatuscontroller "github.com/aws/karpenter-provider-aws/pkg/controllers/instancestatus"
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/metrics"
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/nodeclass"
@@ -112,7 +114,7 @@ func NewControllers(
 		ssminvalidation.NewController(ssmCache, amiProvider),
 		status.NewController[*v1.EC2NodeClass](kubeClient, mgr.GetEventRecorderFor("karpenter")), //nolint:staticcheck // SA1019: will be replaced by mgr.GetEventRecorder once operatorpkg is updated
 		controllersversion.NewController(versionProvider, versionProvider.UpdateVersionWithValidation),
-		crcapacitytype.NewController(kubeClient, cloudProvider),
+		crcapacitytype.NewController(clk, kubeClient, cloudProvider, capacityReservationProvider),
 		crexpiration.NewController(clk, kubeClient, cloudProvider, capacityReservationProvider),
 		metrics.NewController(kubeClient, cloudProvider),
 		arczonalshiftcontroller.NewController(kubeClient, recorder, zonalshiftProvider),
@@ -126,6 +128,11 @@ func NewControllers(
 	// The legacy node repair controller has no EC2StatusReady policy, so status check failures stay on interruption.
 	if coreoptions.FromContext(ctx).FeatureGates.NodeRepair && !coreoptions.FromContext(ctx).LegacyNodeRepair {
 		controllers = append(controllers, instancestatuscontroller.NewController(kubeClient, clk, cloudProvider, instanceStatusProvider))
+	}
+	if crmigration.Enabled(ctx) {
+		controllers = append(controllers, crmigration.NewController(clk, kubeClient, cloudProvider, instanceProvider, capacityReservationProvider, zonalshiftProvider, recorder))
+	} else if options.FromContext(ctx).FeatureGates.ReservedCapacityMigration {
+		log.FromContext(ctx).Info("ReservedCapacityMigration requires the ReservedCapacity feature gate, not starting the capacity reservation migration controller")
 	}
 	if options.FromContext(ctx).InterruptionQueue != "" {
 		sqsAPI := servicesqs.NewFromConfig(cfg)

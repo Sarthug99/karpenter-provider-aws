@@ -156,6 +156,21 @@ var _ = Describe("Options", func() {
 			Expect(opts.FeatureGates.DRANVIDIAGPU).To(BeFalse())
 			Expect(opts.FeatureGates.DRAEFA).To(BeFalse())
 			Expect(opts.FeatureGates.RebootForRepair).To(BeFalse())
+			Expect(opts.FeatureGates.ReservedCapacityMigration).To(BeFalse())
+		})
+		It("should enable ReservedCapacityMigration from the CLI flag", func() {
+			err := opts.Parse(fs, "--cluster-name", "test-cluster", "--aws-feature-gates", "ReservedCapacityMigration=true")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(opts.FeatureGates.ReservedCapacityMigration).To(BeTrue())
+			Expect(opts.FeatureGates.RebootForRepair).To(BeFalse())
+		})
+		It("should enable ReservedCapacityMigration from the AWS_FEATURE_GATES env var", func() {
+			os.Setenv("AWS_FEATURE_GATES", "ReservedCapacityMigration=true")
+			fs = &coreoptions.FlagSet{FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError)}
+			opts.AddFlags(fs)
+			err := opts.Parse(fs, "--cluster-name", "test-cluster")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(opts.FeatureGates.ReservedCapacityMigration).To(BeTrue())
 		})
 		It("should enable RebootForRepair from the CLI flag", func() {
 			err := opts.Parse(fs, "--cluster-name", "test-cluster", "--aws-feature-gates", "RebootForRepair=true")

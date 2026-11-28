@@ -25,9 +25,11 @@ import (
 )
 
 type FeatureGates struct {
-	NodeClassCEL *bool
-	DRANVIDIAGPU *bool
-	DRAEFA       *bool
+	NodeClassCEL              *bool
+	DRANVIDIAGPU              *bool
+	DRAEFA                    *bool
+	RebootForRepair           *bool
+	ReservedCapacityMigration *bool
 }
 
 type OptionsFields struct {
@@ -73,9 +75,11 @@ func Options(overrides ...OptionsFields) *options.Options {
 		SecurityGroupRefreshInterval: lo.FromPtrOr(opts.SecurityGroupRefreshInterval, time.Minute),
 		EnableZonalShift:             lo.FromPtrOr(opts.EnableZonalShift, false),
 		FeatureGates: options.FeatureGates{
-			NodeClassCEL: lo.FromPtrOr(opts.FeatureGates.NodeClassCEL, false),
-			DRANVIDIAGPU: lo.FromPtrOr(opts.FeatureGates.DRANVIDIAGPU, false),
-			DRAEFA:       lo.FromPtrOr(opts.FeatureGates.DRAEFA, false),
+			NodeClassCEL:              lo.FromPtrOr(opts.FeatureGates.NodeClassCEL, false),
+			DRANVIDIAGPU:              lo.FromPtrOr(opts.FeatureGates.DRANVIDIAGPU, false),
+			DRAEFA:                    lo.FromPtrOr(opts.FeatureGates.DRAEFA, false),
+			RebootForRepair:           lo.FromPtrOr(opts.FeatureGates.RebootForRepair, false),
+			ReservedCapacityMigration: lo.FromPtrOr(opts.FeatureGates.ReservedCapacityMigration, false),
 		},
 	}
 }

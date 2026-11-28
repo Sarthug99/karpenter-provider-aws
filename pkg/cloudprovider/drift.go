@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
@@ -66,7 +67,7 @@ func (c *CloudProvider) isNodeClassDrifted(ctx context.Context, nodeClaim *karpv
 	if err != nil {
 		return "", fmt.Errorf("calculating subnet drift, %w", err)
 	}
-	capacityReservationsDrifted, err := c.isCapacityReservationDrifted(ctx, nodeClaim.Status.ProviderID, instance, nodeClass)
+	capacityReservationsDrifted, err := c.isCapacityReservationDrifted(ctx, nodeClaim, instance, nodeClass)
 	if err != nil {
 		return "", fmt.Errorf("calculating capacity reservation drift, %w", err)
 	}
@@ -140,23 +141,49 @@ func (c *CloudProvider) areSecurityGroupsDrifted(ec2Instance *instance.Instance,
 // NOTE: We handle drift dynamically for capacity reservations rather than relying on the offerings inducing drift since
 // a reserved instance may fall back to on-demand. Relying on offerings could result in drift occurring before fallback
 // would cancel it out.
-func (c *CloudProvider) isCapacityReservationDrifted(ctx context.Context, providerID string, i *instance.Instance, nodeClass *v1.EC2NodeClass) (cloudprovider.DriftReason, error) {
-	if i.CapacityReservationDetails == nil {
-		return "", nil
-	}
+func (c *CloudProvider) isCapacityReservationDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim, i *instance.Instance, nodeClass *v1.EC2NodeClass) (cloudprovider.DriftReason, error) {
 	capacityReservationIDs := sets.New(lo.Map(nodeClass.Status.CapacityReservations, func(cr v1.CapacityReservation, _ int) string { return cr.ID })...)
-	if capacityReservationIDs.Has(i.CapacityReservationDetails.ID) {
+	drifted := func(i *instance.Instance) bool {
+		if i.CapacityReservationDetails == nil || capacityReservationIDs.Has(i.CapacityReservationDetails.ID) {
+			return false
+		}
+		// A node re-targeted in place and not yet labeled reserved counts as on-demand; a demoted launched node still drifts.
+		if nodeClaim.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeOnDemand &&
+			nodeClaim.Annotations[v1.AnnotationCapacityReservationMigrationTarget] == i.CapacityReservationDetails.ID {
+			return false
+		}
+		return i.CapacityReservationState.Preference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly ||
+			nodeClaim.Labels[cloudprovider.ReservationIDLabel] == i.CapacityReservationDetails.ID
+	}
+	if !drifted(i) {
 		return "", nil
 	}
 	// skip the instance type cache to get up-to-date instance info
-	i, err := c.getInstance(ctx, providerID, instance.SkipCache)
+	i, err := c.getInstance(ctx, nodeClaim.Status.ProviderID, instance.SkipCache)
 	if err != nil {
 		return "", err
 	}
-	if i.CapacityReservationDetails != nil && !capacityReservationIDs.Has(i.CapacityReservationDetails.ID) {
-		return CapacityReservationDrift, nil
+	if !drifted(i) {
+		return "", nil
 	}
-	return "", nil
+	if c.retargetedPastEndDate(ctx, nodeClaim, i) {
+		return "", nil
+	}
+	return CapacityReservationDrift, nil
+}
+
+// retargetedPastEndDate reports whether a re-targeted node's reservation passed its EndDate; it moves again once EC2 ends it.
+func (c *CloudProvider) retargetedPastEndDate(ctx context.Context, nodeClaim *karpv1.NodeClaim, i *instance.Instance) bool {
+	if i.CapacityReservationState.Preference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly &&
+		nodeClaim.Annotations[v1.AnnotationCapacityReservationMigrationTarget] != i.CapacityReservationDetails.ID {
+		return false
+	}
+	ended, err := c.capacityReservationProvider.PastEndDate(ctx, i.CapacityReservationDetails.ID)
+	if err != nil {
+		// Without the EndDate it drifts like any deselected reservation, rather than dropping the other drift checks.
+		log.FromContext(ctx).WithValues("capacity-reservation-id", i.CapacityReservationDetails.ID).V(1).Info("failed getting capacity reservation, treating it as not past its end date", "error", err.Error())
+	}
+	return ended
 }
 
 // isPlacementGroupDrifted checks if the node's placement group ID label no longer matches the EC2NodeClass's

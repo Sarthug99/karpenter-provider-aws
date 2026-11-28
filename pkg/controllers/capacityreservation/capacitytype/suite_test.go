@@ -18,9 +18,11 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/awslabs/operatorpkg/object"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -68,7 +70,7 @@ var _ = BeforeSuite(func() {
 
 	cloudProvider := cloudprovider.New(awsEnv.InstanceTypesProvider, awsEnv.InstanceProvider, events.NewRecorder(&record.FakeRecorder{}),
 		env.Client, awsEnv.AMIProvider, awsEnv.SecurityGroupProvider, awsEnv.CapacityReservationProvider, awsEnv.PlacementGroupProvider, awsEnv.InstanceTypeStore, lo.ToPtr(""))
-	controller = capacitytype.NewController(env.Client, cloudProvider)
+	controller = capacitytype.NewController(awsEnv.Clock, env.Client, cloudProvider, awsEnv.CapacityReservationProvider)
 })
 
 var _ = AfterSuite(func() {
@@ -107,10 +109,11 @@ var _ = Describe("Capacity Reservation Capacity Type Controller", func() {
 		nodeClaim = coretest.NodeClaim(karpv1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
-					karpv1.CapacityTypeLabelKey:          karpv1.CapacityTypeReserved,
-					corecloudprovider.ReservationIDLabel: reservationID,
-					v1.LabelCapacityReservationType:      string(v1.CapacityReservationTypeDefault),
-					karpv1.NodeRegisteredLabelKey:        "true",
+					karpv1.CapacityTypeLabelKey:              karpv1.CapacityTypeReserved,
+					corecloudprovider.ReservationIDLabel:     reservationID,
+					v1.LabelCapacityReservationType:          string(v1.CapacityReservationTypeDefault),
+					v1.LabelCapacityReservationInterruptible: "false",
+					karpv1.NodeRegisteredLabelKey:            "true",
 				},
 			},
 			Status: karpv1.NodeClaimStatus{
@@ -144,10 +147,12 @@ var _ = Describe("Capacity Reservation Capacity Type Controller", func() {
 		Expect(nodeClaim.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeOnDemand))
 		Expect(nodeClaim.Labels).ToNot(HaveKey(corecloudprovider.ReservationIDLabel))
 		Expect(nodeClaim.Labels).ToNot(HaveKey(v1.LabelCapacityReservationType))
+		Expect(nodeClaim.Labels).ToNot(HaveKey(v1.LabelCapacityReservationInterruptible))
 		node = ExpectExists(ctx, env.Client, node)
 		Expect(node.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeOnDemand))
 		Expect(node.Labels).ToNot(HaveKey(corecloudprovider.ReservationIDLabel))
 		Expect(node.Labels).ToNot(HaveKey(v1.LabelCapacityReservationType))
+		Expect(node.Labels).ToNot(HaveKey(v1.LabelCapacityReservationInterruptible))
 	})
 	It("should demote nodes from reserved to on-demand even if their nodeclaim was demoted previously", func() {
 		out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
@@ -167,5 +172,129 @@ var _ = Describe("Capacity Reservation Capacity Type Controller", func() {
 		Expect(node.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeOnDemand))
 		Expect(node.Labels).ToNot(HaveKey(corecloudprovider.ReservationIDLabel))
 		Expect(node.Labels).ToNot(HaveKey(v1.LabelCapacityReservationType))
+	})
+	Context("Promotion", func() {
+		var nodeClass *v1.EC2NodeClass
+		BeforeEach(func() {
+			awsEnv.CapacityReservationProvider.ResetMigrations()
+			// Re-targeted in place: covered by its target, with no capacity-reservations-only preference.
+			out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
+			out.Reservations[0].Instances[0].CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+				CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr(reservationID)},
+			}
+			awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(out)
+			nodeClass = test.EC2NodeClass()
+			nodeClass.Status.CapacityReservations = []v1.CapacityReservation{{
+				ID: reservationID, AvailabilityZone: "test-zone-1a", InstanceType: "m5.large", OwnerID: "012345678901",
+				InstanceMatchCriteria: string(ec2types.InstanceMatchCriteriaTargeted), ReservationType: v1.CapacityReservationTypeDefault, State: v1.CapacityReservationStateActive,
+			}}
+			ExpectApplied(ctx, env.Client, nodeClass)
+			nodeClaim.Spec.NodeClassRef = &karpv1.NodeClassReference{Group: object.GVK(nodeClass).Group, Kind: object.GVK(nodeClass).Kind, Name: nodeClass.Name}
+			for _, labels := range []map[string]string{nodeClaim.Labels, node.Labels} {
+				labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeOnDemand
+				delete(labels, corecloudprovider.ReservationIDLabel)
+				delete(labels, v1.LabelCapacityReservationType)
+				delete(labels, v1.LabelCapacityReservationInterruptible)
+			}
+			nodeClaim.Annotations = map[string]string{
+				v1.AnnotationCapacityReservationMigrationTarget:      reservationID,
+				v1.AnnotationCapacityReservationMigrationRequestedAt: awsEnv.Clock.Now().UTC().Format(time.RFC3339),
+			}
+			awsEnv.CapacityReservationProvider.SetAvailableInstanceCount(reservationID, 2)
+		})
+		AfterEach(func() {
+			ExpectCleanedUp(ctx, env.Client)
+		})
+		expectCapacityType := func(capacityType string) {
+			GinkgoHelper()
+			for _, labels := range []map[string]string{ExpectExists(ctx, env.Client, nodeClaim).Labels, ExpectExists(ctx, env.Client, node).Labels} {
+				Expect(labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, capacityType))
+			}
+		}
+		It("should finish a migration the migration controller started", func() {
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			ExpectSingletonReconciled(ctx, controller)
+			for _, labels := range []map[string]string{ExpectExists(ctx, env.Client, nodeClaim).Labels, ExpectExists(ctx, env.Client, node).Labels} {
+				Expect(labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
+				Expect(labels).To(HaveKeyWithValue(corecloudprovider.ReservationIDLabel, reservationID))
+				Expect(labels).To(HaveKeyWithValue(v1.LabelCapacityReservationType, string(v1.CapacityReservationTypeDefault)))
+			}
+			Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(HaveKeyWithValue(v1.AnnotationCapacityReservationMigrationTarget, reservationID))
+			Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationRequestedAt))
+			// EC2's count includes the instance before our cache does.
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(1))
+		})
+		It("should not promote coverage the migration controller didn't start", func() {
+			nodeClaim.Annotations = nil
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			ExpectSingletonReconciled(ctx, controller)
+			expectCapacityType(karpv1.CapacityTypeOnDemand)
+		})
+		It("should still finish an annotated migration whose NodePool now requires on-demand", func() {
+			nodePool := coretest.NodePool(karpv1.NodePool{Spec: karpv1.NodePoolSpec{Template: karpv1.NodeClaimTemplate{Spec: karpv1.NodeClaimTemplateSpec{
+				Requirements: []karpv1.NodeSelectorRequirementWithMinValues{{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeOnDemand}}},
+			}}}})
+			nodeClaim.Labels[karpv1.NodePoolLabelKey] = nodePool.Name
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectSingletonReconciled(ctx, controller)
+			// Labels follow EC2, as in the migration controller; requirements drift handles the NodePool.
+			expectCapacityType(karpv1.CapacityTypeReserved)
+		})
+		It("should not promote when the annotation names another reservation", func() {
+			nodeClaim.Annotations[v1.AnnotationCapacityReservationMigrationTarget] = "cr-other"
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			ExpectSingletonReconciled(ctx, controller)
+			expectCapacityType(karpv1.CapacityTypeOnDemand)
+		})
+		It("should not promote a reservation the EC2NodeClass no longer selects", func() {
+			nodeClass.Status.CapacityReservations = nil
+			ExpectApplied(ctx, env.Client, nodeClass)
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			ExpectSingletonReconciled(ctx, controller)
+			expectCapacityType(karpv1.CapacityTypeOnDemand)
+		})
+		It("should leave completion to the migration controller while its gate is on", func() {
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			gateOn := options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacityMigration: lo.ToPtr(true)}}))
+			ExpectSingletonReconciled(gateOn, controller)
+			expectCapacityType(karpv1.CapacityTypeOnDemand)
+		})
+		It("should relabel a Node left on-demand under a reserved NodeClaim", func() {
+			nodeClaim.Annotations = nil
+			nodeClaim.Labels = lo.Assign(nodeClaim.Labels, map[string]string{
+				karpv1.CapacityTypeLabelKey:          karpv1.CapacityTypeReserved,
+				corecloudprovider.ReservationIDLabel: reservationID,
+				v1.LabelCapacityReservationType:      string(v1.CapacityReservationTypeDefault),
+			})
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			ExpectSingletonReconciled(ctx, controller)
+			labels := ExpectExists(ctx, env.Client, node).Labels
+			Expect(labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
+			Expect(labels).To(HaveKeyWithValue(corecloudprovider.ReservationIDLabel, reservationID))
+			Expect(labels).To(HaveKeyWithValue(v1.LabelCapacityReservationType, string(v1.CapacityReservationTypeDefault)))
+		})
+		It("should demote a reserved NodeClaim covered by a reservation it isn't labeled with", func() {
+			nodeClaim.Annotations = nil
+			for _, labels := range []map[string]string{nodeClaim.Labels, node.Labels} {
+				labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeReserved
+				labels[corecloudprovider.ReservationIDLabel] = "cr-old"
+				labels[v1.LabelCapacityReservationType] = string(v1.CapacityReservationTypeDefault)
+				labels[v1.LabelCapacityReservationInterruptible] = "false"
+			}
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			ExpectSingletonReconciled(ctx, controller)
+			expectCapacityType(karpv1.CapacityTypeOnDemand)
+			for _, labels := range []map[string]string{ExpectExists(ctx, env.Client, nodeClaim).Labels, ExpectExists(ctx, env.Client, node).Labels} {
+				Expect(labels).ToNot(HaveKey(corecloudprovider.ReservationIDLabel))
+			}
+		})
+		It("should skip a deleting NodeClaim", func() {
+			nodeClaim.Finalizers = []string{karpv1.TerminationFinalizer}
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			Expect(env.Client.Delete(ctx, nodeClaim)).To(Succeed())
+			ExpectSingletonReconciled(ctx, controller)
+			expectCapacityType(karpv1.CapacityTypeOnDemand)
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+		})
 	})
 })
