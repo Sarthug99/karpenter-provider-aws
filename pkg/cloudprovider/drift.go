@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
@@ -146,7 +147,11 @@ func (c *CloudProvider) isCapacityReservationDrifted(ctx context.Context, nodeCl
 		if i.CapacityReservationDetails == nil || capacityReservationIDs.Has(i.CapacityReservationDetails.ID) {
 			return false
 		}
-		// An in-place re-target Karpenter hasn't labeled reserved stays on-demand to us, as it was before the migration gate.
+		// A node re-targeted in place and not yet labeled reserved counts as on-demand; a demoted launched node still drifts.
+		if nodeClaim.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeOnDemand &&
+			nodeClaim.Annotations[v1.AnnotationCapacityReservationMigrationTarget] == i.CapacityReservationDetails.ID {
+			return false
+		}
 		return i.CapacityReservationState.Preference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly ||
 			nodeClaim.Labels[cloudprovider.ReservationIDLabel] == i.CapacityReservationDetails.ID
 	}
@@ -158,10 +163,27 @@ func (c *CloudProvider) isCapacityReservationDrifted(ctx context.Context, nodeCl
 	if err != nil {
 		return "", err
 	}
-	if drifted(i) {
-		return CapacityReservationDrift, nil
+	if !drifted(i) {
+		return "", nil
 	}
-	return "", nil
+	if c.retargetedPastEndDate(ctx, nodeClaim, i) {
+		return "", nil
+	}
+	return CapacityReservationDrift, nil
+}
+
+// retargetedPastEndDate reports whether a re-targeted node's reservation passed its EndDate; it moves again once EC2 ends it.
+func (c *CloudProvider) retargetedPastEndDate(ctx context.Context, nodeClaim *karpv1.NodeClaim, i *instance.Instance) bool {
+	if i.CapacityReservationState.Preference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly &&
+		nodeClaim.Annotations[v1.AnnotationCapacityReservationMigrationTarget] != i.CapacityReservationDetails.ID {
+		return false
+	}
+	ended, err := c.capacityReservationProvider.PastEndDate(ctx, i.CapacityReservationDetails.ID)
+	if err != nil {
+		// Without the EndDate it drifts like any deselected reservation, rather than dropping the other drift checks.
+		log.FromContext(ctx).WithValues("capacity-reservation-id", i.CapacityReservationDetails.ID).V(1).Info("failed getting capacity reservation, treating it as not past its end date", "error", err.Error())
+	}
+	return ended
 }
 
 // isPlacementGroupDrifted checks if the node's placement group ID label no longer matches the EC2NodeClass's

@@ -256,14 +256,14 @@ var (
 		Example: "cr-56fac701cc1951b03",
 		UsedOn:  []runtime.Object{&karpv1.NodeClaim{}},
 		Help: "With the ReservedCapacityMigration feature gate, Karpenter sets this to the capacity reservation it " +
-			"re-targeted the NodeClaim's running instance at, and removes it once EC2 reports the instance covered " +
-			"and the NodeClaim is relabeled reserved.",
+			"re-targeted the NodeClaim's running instance at. It stays once EC2 reports the instance covered and the " +
+			"NodeClaim is relabeled reserved, so a demotion from stale EC2 data is relabeled again.",
 		Stage:        docs.Alpha,
 		InternalOnly: true,
 	}
 	CapacityReservationMigrationRequestedAtAnnotation = wellknown.Annotation{
 		Name:    AnnotationCapacityReservationMigrationRequestedAt,
-		Example: "2026-11-20T10:00:00Z",
+		Example: "2024-01-01T00:00:00Z",
 		UsedOn:  []runtime.Object{&karpv1.NodeClaim{}},
 		Help: "With the ReservedCapacityMigration feature gate, Karpenter sets this to the RFC3339 time it " +
 			"re-targeted the NodeClaim's instance at a capacity reservation, to measure coverage lag.",

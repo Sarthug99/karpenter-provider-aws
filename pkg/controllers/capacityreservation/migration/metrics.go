@@ -38,6 +38,8 @@ const (
 	reasonNodePoolIncompatible = "nodepool_incompatible"
 	reasonNoCapacity           = "no_capacity"
 	reasonNoCompatibleCR       = "no_compatible_cr"
+	reasonZonalShift           = "zonal_shift"
+	reasonUnauthorized         = "unauthorized"
 )
 
 var (
@@ -47,7 +49,7 @@ var (
 		Values: []opmetrics.Value{
 			{Name: resultSuccess, Help: "EC2 accepted the new target."},
 			{Name: resultClientError, Help: "EC2 rejected the request, e.g. the transition or target is not allowed."},
-			{Name: resultUnauthorized, Help: "The controller role lacks ec2:ModifyInstanceCapacityReservationAttributes."},
+			{Name: resultUnauthorized, Help: "EC2 denied ec2:ModifyInstanceCapacityReservationAttributes for the instance or target capacity reservation."},
 			{Name: resultThrottled, Help: "EC2 throttled the request."},
 			{Name: resultError, Help: "Any other error."},
 		},
@@ -73,6 +75,8 @@ var (
 			{Name: reasonNodePoolIncompatible, Help: "The NodePool requirements don't allow the reserved labels."},
 			{Name: reasonNoCapacity, Help: "Every compatible capacity reservation is full."},
 			{Name: reasonNoCompatibleCR, Help: "No capacity reservation selected by the EC2NodeClass matches the instance."},
+			{Name: reasonZonalShift, Help: "The instance's availability zone is zonally shifted away from."},
+			{Name: reasonUnauthorized, Help: "EC2 denied moving the instance into every compatible capacity reservation with a free slot, so they are backing off."},
 		},
 	}
 
@@ -104,7 +108,7 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: subsystem,
 			Name:      "pending",
-			Help:      "Number of nodes re-targeted at a capacity reservation that EC2 doesn't report covered yet.",
+			Help:      "Number of nodes re-targeted at a capacity reservation that EC2 doesn't report covered yet, excluding stalled ones.",
 		},
 		[]opmetrics.Label{reservationIDLabel},
 		opmetrics.Alpha,

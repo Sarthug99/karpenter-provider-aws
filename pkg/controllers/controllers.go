@@ -114,7 +114,7 @@ func NewControllers(
 		ssminvalidation.NewController(ssmCache, amiProvider),
 		status.NewController[*v1.EC2NodeClass](kubeClient, mgr.GetEventRecorderFor("karpenter")), //nolint:staticcheck // SA1019: will be replaced by mgr.GetEventRecorder once operatorpkg is updated
 		controllersversion.NewController(versionProvider, versionProvider.UpdateVersionWithValidation),
-		crcapacitytype.NewController(kubeClient, cloudProvider),
+		crcapacitytype.NewController(clk, kubeClient, cloudProvider, capacityReservationProvider),
 		crexpiration.NewController(clk, kubeClient, cloudProvider, capacityReservationProvider),
 		metrics.NewController(kubeClient, cloudProvider),
 		arczonalshiftcontroller.NewController(kubeClient, recorder, zonalshiftProvider),
@@ -130,7 +130,7 @@ func NewControllers(
 		controllers = append(controllers, instancestatuscontroller.NewController(kubeClient, clk, cloudProvider, instanceStatusProvider))
 	}
 	if crmigration.Enabled(ctx) {
-		controllers = append(controllers, crmigration.NewController(clk, kubeClient, cloudProvider, instanceProvider, capacityReservationProvider, recorder))
+		controllers = append(controllers, crmigration.NewController(clk, kubeClient, cloudProvider, instanceProvider, capacityReservationProvider, zonalshiftProvider, recorder))
 	} else if options.FromContext(ctx).FeatureGates.ReservedCapacityMigration {
 		log.FromContext(ctx).Info("ReservedCapacityMigration requires the ReservedCapacity feature gate, not starting the capacity reservation migration controller")
 	}

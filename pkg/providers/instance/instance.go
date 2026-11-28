@@ -362,20 +362,18 @@ func (p *DefaultProvider) Reboot(ctx context.Context, id string, operationID str
 func (p *DefaultProvider) ModifyCapacityReservationTarget(ctx context.Context, id string, capacityReservationID string) error {
 	out, err := p.Get(ctx, id)
 	if err != nil {
-		if cloudprovider.IsNodeClaimNotFoundError(err) {
-			return err
-		}
 		return fmt.Errorf("%w, %w", ErrModifyNotAttempted, err)
 	}
 	if out.ZoneID != "" && p.zonalshiftProvider.IsZonalShifted(ctx, out.ZoneID) {
 		return fmt.Errorf("%w, instance %s is in zonally shifted availability zone %s (%s)", ErrModifyNotAttempted, id, out.Zone, out.ZoneID)
 	}
+	// No SDK retries: the call isn't idempotent, and a retry's error would hide whether an earlier attempt landed.
 	if _, err := p.ec2api.ModifyInstanceCapacityReservationAttributes(ctx, &ec2.ModifyInstanceCapacityReservationAttributesInput{
 		InstanceId: lo.ToPtr(id),
 		CapacityReservationSpecification: &ec2types.CapacityReservationSpecification{
 			CapacityReservationTarget: &ec2types.CapacityReservationTarget{CapacityReservationId: lo.ToPtr(capacityReservationID)},
 		},
-	}); err != nil {
+	}, func(o *ec2.Options) { o.RetryMaxAttempts = 1 }); err != nil {
 		// Only a missing instance means the NodeClaim is gone; a missing reservation is a client error.
 		if apiErr, ok := lo.ErrorsAs[smithy.APIError](err); ok && apiErr.ErrorCode() == "InvalidInstanceID.NotFound" {
 			return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("modifying instance capacity reservation attributes, %w", err))

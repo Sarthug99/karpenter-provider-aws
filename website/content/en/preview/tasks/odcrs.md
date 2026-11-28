@@ -129,6 +129,7 @@ Karpenter will begin draining nodes launched for IODCRs when the 2-minute interr
 With the `ReservedCapacityMigration` [AWS feature gate]({{<ref "../reference/settings#aws-specific-feature-gates" >}}) enabled, Karpenter moves running nodes into a capacity reservation without replacing them.
 It uses [ModifyInstanceCapacityReservationAttributes](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyInstanceCapacityReservationAttributes.html), which needs the `ec2:ModifyInstanceCapacityReservationAttributes` permission on the controller role.
 The gate has no effect without the `ReservedCapacity` feature gate.
+In Regions where EC2 doesn't yet support re-targeting running instances, migration stays idle: Karpenter logs it once and retries after an hour, backing off to six hours.
 
 Karpenter considers two kinds of nodes:
 - on-demand nodes that don't target any capacity reservation
@@ -136,15 +137,30 @@ Karpenter considers two kinds of nodes:
 
 A node is moved only when all of the following hold:
 - its NodePool requirements allow `karpenter.sh/capacity-type: reserved` and the reservation's labels
-- every pod on it, including DaemonSet pods and excluding static pods, can run on a reserved node in that reservation. Only required node affinity and `nodeSelector` are checked; preferred affinity doesn't block a move.
-- the reservation is in the EC2NodeClass's `status.capacityReservations`, is a `default` (not capacity block or interruptible) reservation, matches the node's instance type, zone, platform and tenancy, and has a free slot
+- every pod on it, including DaemonSet pods and excluding static pods, can run on a reserved node in that reservation. Only required node affinity and `nodeSelector` are checked; preferred affinity doesn't block a move. Topology spread constraints and pod (anti-)affinity keyed on `karpenter.sh/capacity-type` or `karpenter.k8s.aws/capacity-reservation-id` aren't checked, so a move can break them.
+- only pods already on the node are checked. A DaemonSet or pending pod whose required node affinity only matches after the relabel can then be scheduled there: on a full node it can preempt lower-priority pods, or stay `Pending`
+- the reservation is in the EC2NodeClass's `status.capacityReservations`, is a `default` (not capacity block or interruptible) reservation, matches the node's instance type, zone, platform and tenancy, isn't in a placement group or on an Outpost, and has a free slot
 
-Karpenter re-targets the instance and keeps the node labeled `on-demand` until EC2 reports it covered by the reservation. Coverage is usually reported within seconds.
+Karpenter skips nodes in an availability zone that is zonally shifted away from, and reservations that end within an hour.
+Slots already promised to reserved NodeClaims that haven't launched yet aren't used.
+
+Karpenter re-targets the instance and keeps the node labeled `on-demand` until EC2 reports it covered by the reservation. Coverage is usually reported within seconds, but can take several minutes. If it isn't reported within 30 minutes, Karpenter emits a `CapacityReservationMigrationStalled` event and stops holding the reservation's slot for the node.
 It then labels the NodeClaim and Node `reserved`, with `karpenter.k8s.aws/capacity-reservation-id`, `karpenter.k8s.aws/capacity-reservation-type: default` and `karpenter.k8s.aws/capacity-reservation-interruptible: false`.
-No node is drained or replaced. Karpenter checks the NodePool, the pods and the EC2NodeClass again before relabeling.
-If one of them no longer allows the reservation, for example because a pod requiring `on-demand` was scheduled while the move was pending, the node stays labeled `on-demand` and Karpenter emits a `CapacityReservationMigrationNotRelabeled` event. Karpenter relabels it later if they allow the reservation again.
+No node is drained or replaced.
+Labels follow what EC2 reports: once the instance is covered, Karpenter labels it `reserved` even if the NodePool or a pod stopped allowing that while the move was pending, and emits a `CapacityReservationMigrationIncompatible` warning event.
+[Drift]({{<ref "../concepts/disruption#drift" >}}) then replaces the node if its NodePool no longer allows `reserved`.
+If the EC2NodeClass no longer selects the reservation, the node stays labeled `on-demand`, as with an `open` reservation match, and Karpenter emits a `CapacityReservationMigrationNotRelabeled` event. It relabels the node if the reservation is selected again. A node EC2 reports with the `capacity-reservations-only` preference is instead replaced by drift, like a node launched into the reservation.
+A migrated node whose reservation passes its end date stays labeled `reserved` until EC2 ends the reservation, then is relabeled `on-demand` and moved again.
+If the gate is turned off while a move is pending, Karpenter still labels the node `reserved` once EC2 covers it. With the gate off, instances re-targeted outside Karpenter stay labeled `on-demand`.
+
+{{% alert title="Note" color="primary" %}}
+Selecting a capacity reservation in an EC2NodeClass now also lets running nodes move into it, not only new launches.
+To keep free slots for new launches, select fewer reservations or restrict the NodePool's `karpenter.sh/capacity-type` or `karpenter.k8s.aws/capacity-reservation-id` requirements.
+{{% /alert %}}
 
 {{% alert title="Warning" color="warning" %}}
+Rolling back to a Karpenter version without this classification labels migrated nodes `on-demand` again but keeps their `karpenter.k8s.aws/capacity-reservation-interruptible` label, which on-demand offerings don't allow. Drift (`InstanceTypeNotFound`) then replaces them in any NodePool, subject to disruption budgets and `karpenter.sh/do-not-disrupt`, and DaemonSet pods that require `reserved` are removed from them. To keep the nodes, remove that label from their NodeClaims once they are relabeled `on-demand`.
+
 The move can't be undone. Once an instance targets a capacity reservation, it can't return to on-demand without being replaced.
 Nodes launched before `ReservedCapacity` was enabled have the `open` capacity reservation preference and are never moved.
 {{% /alert %}}

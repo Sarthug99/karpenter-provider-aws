@@ -26,6 +26,7 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/smithy-go"
 	"github.com/awslabs/operatorpkg/reconciler"
+	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/awslabs/operatorpkg/singleton"
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -52,23 +54,28 @@ import (
 	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
 	awserrors "github.com/aws/karpenter-provider-aws/pkg/errors"
 	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/arczonalshift"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/capacityreservation"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instance"
 	"github.com/aws/karpenter-provider-aws/pkg/utils"
 )
 
 const (
-	maxModifyCallsPerPass   = 10
-	stallThreshold          = 30 * time.Minute
+	maxModifyCallsPerPass = 10
+	conflictRequeue       = 5 * time.Second
+	stallThreshold        = 30 * time.Minute
+	// Coverage can take up to stallThreshold, so a reservation ending sooner than this would barely hold the node.
+	minReservationRemaining = time.Hour
 	initialBackoff          = 5 * time.Minute
 	maxBackoff              = time.Hour
-	unauthorizedLogInterval = 10 * time.Minute
 	// DescribeInstances can lag a Modify, so a missing target isn't trusted until this long after the call.
 	modifyVisibilityGrace = 5 * time.Minute
+	unsupportedBackoff    = time.Hour
+	maxUnsupportedBackoff = 6 * time.Hour
 )
 
 // serverErrorCodes are EC2 faults after which a Modify may still have been applied.
-var serverErrorCodes = sets.New("InternalError", "InternalFailure", "ServiceUnavailable", "Unavailable", "RequestTimeout", "RequestExpired")
+var serverErrorCodes = sets.New("InternalError", "InternalFailure", "ServiceUnavailable", "Unavailable", "RequestTimeout")
 
 // Enabled reports whether the controller should run; it needs core ReservedCapacity for reserved offerings and labels.
 func Enabled(ctx context.Context) bool {
@@ -87,24 +94,42 @@ type Controller struct {
 	cloudProvider    cloudprovider.CloudProvider
 	instanceProvider instance.Provider
 	crProvider       capacityreservation.Provider
+	zonalShift       arczonalshift.Provider
 	recorder         events.Recorder
 
-	backoff          map[string]backoffEntry
-	cases            map[string]string // instance ID -> migration case, for metrics only
-	unauthorizedLogs time.Time
+	backoff      map[string]backoffEntry
+	cases        map[string]string           // instance ID -> migration case, for metrics only
+	denied       map[slot]backoffEntry       // instance in a reservation -> backoff after EC2 denied that move
+	deniedBy     map[string]sets.Set[string] // reservation ID -> instances denied since its last backoff or success
+	unauthorized map[string]time.Time        // reservation ID -> end of its backoff
+	covered      sets.Set[slot]              // instances marked migrated in a reservation without completing
+	pendingSince map[slot]time.Time          // holds without a matching requested-at -> first pass that held them
+	unsupported  backoffEntry                // EC2 can't re-target running instances in this Region yet
+}
+
+// slot is an instance in a reservation.
+type slot struct {
+	instanceID    string
+	reservationID string
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, instanceProvider instance.Provider,
-	crProvider capacityreservation.Provider, recorder events.Recorder) *Controller {
+	crProvider capacityreservation.Provider, zonalShift arczonalshift.Provider, recorder events.Recorder) *Controller {
 	return &Controller{
 		clk:              clk,
 		kubeClient:       kubeClient,
 		cloudProvider:    cloudProvider,
 		instanceProvider: instanceProvider,
 		crProvider:       crProvider,
+		zonalShift:       zonalShift,
 		recorder:         recorder,
 		backoff:          map[string]backoffEntry{},
 		cases:            map[string]string{},
+		denied:           map[slot]backoffEntry{},
+		deniedBy:         map[string]sets.Set[string]{},
+		unauthorized:     map[string]time.Time{},
+		covered:          sets.New[slot](),
+		pendingSince:     map[slot]time.Time{},
 	}
 }
 
@@ -121,21 +146,26 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 
 // pass memoizes API reads for one reconcile.
 type pass struct {
+	start       time.Time
+	observed    time.Time // when the DescribeInstances sweep returned, so after any coverage it shows
 	nodeClasses map[string]*v1.EC2NodeClass
 	nodePools   map[string]*karpv1.NodePool
 	raw         map[string]map[string]*ec2types.CapacityReservation // nodeclass name -> reservation id -> reservation
 	active      map[string]bool
+	failed      map[string]error // reservation query -> error, so a failing query isn't repeated within the pass
 	pending     map[string]sets.Set[string]
+	waiting     sets.Set[slot] // pendingSince entries checked this pass
+	launching   map[string]int // reservation ID -> reserved NodeClaims not yet launched
 	ineligible  map[string]int
-	stalled     int
+	stalled     sets.Set[slot]
 }
 
 type candidate struct {
 	nodeClaim    *karpv1.NodeClaim
-	node         *corev1.Node
 	instance     *instance.Instance
 	caseLabel    string
 	reservations []string
+	endTimes     map[string]time.Time // reservation ID -> end, zero if it never ends
 }
 
 //nolint:gocyclo
@@ -143,63 +173,91 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 	nodeClaims, err := nodeclaimutils.ListManaged(ctx, c.kubeClient, c.cloudProvider)
 	if err != nil {
-		return reconciler.Result{}, fmt.Errorf("listing nodeclaims, %w", err)
+		log.FromContext(ctx).Error(err, "failed listing nodeclaims")
+		return reconciler.Result{RequeueAfter: time.Minute}, nil
 	}
+	idle, err := c.idle(ctx, nodeClaims)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed listing ec2nodeclasses")
+		return reconciler.Result{RequeueAfter: time.Minute}, nil
+	}
+	if idle {
+		// Skip the DescribeInstances sweep, which would find nothing to move or hold.
+		c.crProvider.SetPendingMigrations(nil)
+		c.publishGauges(&pass{})
+		return reconciler.Result{RequeueAfter: time.Minute}, nil
+	}
+	start := c.clk.Now()
 	instances, err := c.instanceProvider.List(ctx)
 	if err != nil {
-		return reconciler.Result{}, fmt.Errorf("listing instances, %w", err)
+		log.FromContext(ctx).Error(err, "failed listing instances")
+		return reconciler.Result{RequeueAfter: time.Minute}, nil
 	}
 	byID := lo.KeyBy(instances, func(i *instance.Instance) string { return i.ID })
 	p := &pass{
+		start:       start,
+		observed:    c.clk.Now(),
 		nodeClasses: map[string]*v1.EC2NodeClass{},
 		nodePools:   map[string]*karpv1.NodePool{},
 		raw:         map[string]map[string]*ec2types.CapacityReservation{},
 		active:      map[string]bool{},
+		failed:      map[string]error{},
 		pending:     map[string]sets.Set[string]{},
+		waiting:     sets.New[slot](),
+		launching:   map[string]int{},
 		ineligible:  map[string]int{},
+		stalled:     sets.New[slot](),
 	}
 	c.prune(byID)
 
 	var errs []error
-	var unclaimed []*karpv1.NodeClaim
+	var unclaimed []*candidate
 	for _, nc := range nodeClaims {
 		id, err := utils.ParseInstanceID(nc.Status.ProviderID)
 		if err != nil {
+			p.holdLaunch(nc)
 			continue
 		}
 		inst, ok := byID[id]
-		target := nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget]
-		// A draining or briefly unlisted instance keeps its EC2 target, so its slot stays held.
+		target := trackedTarget(nc)
+		// A draining or briefly unlisted instance keeps its EC2 target, so its slot stays held until the move stalls.
 		if !nc.DeletionTimestamp.IsZero() {
 			if ok {
-				p.hold(target, id)
+				c.holdOrCovered(p, nc, target, inst)
 			}
 			continue
 		}
 		if !ok {
-			p.hold(target, id)
+			if !c.stalled(p, nc, id, target) {
+				p.hold(target, id)
+			}
 			continue
 		}
 		free, err := c.reconcileTracked(ctx, p, nc, inst)
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, serrors.Wrap(err, "NodeClaim", klog.KObj(nc)))
 			// Stay conservative: an error must not release a slot this instance may hold.
-			p.hold(target, id)
-			p.hold(inst.CapacityReservationState.TargetID, id)
+			c.holdOrCovered(p, nc, target, inst)
+			c.holdOrCovered(p, nc, inst.CapacityReservationState.TargetID, inst)
 			continue
 		}
 		if free {
-			unclaimed = append(unclaimed, nc)
+			unclaimed = append(unclaimed, &candidate{nodeClaim: nc, instance: inst})
+		}
+	}
+	for s := range c.pendingSince {
+		if !p.waiting.Has(s) {
+			delete(c.pendingSince, s)
 		}
 	}
 	// Publish the ledger before selection so the scheduler and our budget both see in-flight migrations.
 	c.crProvider.SetPendingMigrations(p.pending)
 
 	var candidates []*candidate
-	for _, nc := range unclaimed {
-		cand, err := c.eligible(ctx, p, nc, byID)
+	for _, u := range lo.Ternary(c.clk.Now().Before(c.unsupported.next), nil, unclaimed) {
+		cand, err := c.eligible(ctx, p, u.nodeClaim, u.instance)
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, serrors.Wrap(err, "NodeClaim", klog.KObj(u.nodeClaim)))
 			continue
 		}
 		if cand != nil {
@@ -217,17 +275,33 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		}
 		return candidates[i].nodeClaim.Name < candidates[j].nodeClaim.Name
 	})
-	errs = append(errs, c.migrate(ctx, p, candidates)...)
+	calls, migrateErrs := c.migrate(ctx, p, candidates)
+	errs = lo.Compact(append(errs, migrateErrs...))
 	c.publishGauges(p)
 
-	errs = lo.Compact(errs)
-	if len(errs) != 0 {
-		if lo.EveryBy(errs, func(err error) bool { return errors.IsConflict(err) }) {
-			return reconciler.Result{Requeue: true}, nil
-		}
-		return reconciler.Result{}, multierr.Combine(errs...)
+	for _, err := range errs {
+		log.FromContext(ctx).Error(err, "failed reconciling capacity reservation migration")
+	}
+	// Errors keep the regular cadence; a conflict-only pass with no Modify calls retries soon without a fresh call budget.
+	if len(errs) != 0 && calls == 0 && lo.EveryBy(errs, func(err error) bool { return errors.IsConflict(err) }) {
+		return reconciler.Result{RequeueAfter: conflictRequeue}, nil
 	}
 	return reconciler.Result{RequeueAfter: time.Minute}, nil
+}
+
+// idle reports whether there is nothing to move or hold: no tracked migration and no EC2NodeClass with a reservation.
+func (c *Controller) idle(ctx context.Context, nodeClaims []*karpv1.NodeClaim) (bool, error) {
+	if lo.SomeBy(nodeClaims, func(nc *karpv1.NodeClaim) bool { return trackedTarget(nc) != "" }) {
+		return false, nil
+	}
+	if c.clk.Now().Before(c.unsupported.next) {
+		return true, nil
+	}
+	nodeClasses := &v1.EC2NodeClassList{}
+	if err := c.kubeClient.List(ctx, nodeClasses); err != nil {
+		return false, err
+	}
+	return lo.NoneBy(nodeClasses.Items, func(nodeClass v1.EC2NodeClass) bool { return len(nodeClass.Status.CapacityReservations) != 0 }), nil
 }
 
 // reconcileTracked advances a NodeClaim that already has a target, and reports whether it is free for a new migration.
@@ -235,8 +309,8 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 //nolint:gocyclo
 func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.NodeClaim, inst *instance.Instance) (bool, error) {
 	state := inst.CapacityReservationState
-	target, tracked := nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget]
-	if !tracked {
+	target := trackedTarget(nc)
+	if target == "" {
 		// Adopt an instance re-targeted but not yet recorded, e.g. a Modify that timed out client-side but succeeded.
 		if nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand || state.TargetID == "" {
 			return true, nil
@@ -249,9 +323,9 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 			return false, err
 		}
 		if !ok {
-			return true, c.holdUncovered(ctx, p, inst)
+			return true, c.holdUncovered(ctx, p, nc, inst)
 		}
-		if err := c.setTarget(ctx, nc, state.TargetID); err != nil {
+		if err := c.setTarget(ctx, nc, state.TargetID, state.CoveringID != state.TargetID); err != nil {
 			return false, err
 		}
 		target = state.TargetID
@@ -271,9 +345,9 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 			return false, err
 		}
 		if !ok {
-			return true, multierr.Combine(c.holdUncovered(ctx, p, inst), c.clearTarget(ctx, nc))
+			return true, multierr.Combine(c.holdUncovered(ctx, p, nc, inst), c.clearTarget(ctx, nc))
 		}
-		if err := c.setTarget(ctx, nc, state.TargetID); err != nil {
+		if err := c.setTarget(ctx, nc, state.TargetID, state.CoveringID != state.TargetID); err != nil {
 			return false, err
 		}
 		target = state.TargetID
@@ -281,7 +355,7 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 	if state.CoveringID == target {
 		return false, c.complete(ctx, p, nc, inst, target)
 	}
-	active, err := c.isActive(ctx, p, target)
+	active, err := c.isActive(ctx, p, nc, target)
 	if err != nil {
 		return false, err
 	}
@@ -289,27 +363,70 @@ func (c *Controller) reconcileTracked(ctx context.Context, p *pass, nc *karpv1.N
 		// The target died while pending; this is now the orphaned case.
 		return true, c.clearTarget(ctx, nc)
 	}
-	p.hold(target, inst.ID)
-	if requestedAt, err := time.Parse(time.RFC3339, nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]); err == nil {
-		if pendingFor := c.clk.Since(requestedAt); pendingFor > stallThreshold {
-			p.stalled++
-			c.recorder.Publish(stalledEvent(nc, target, pendingFor))
-		}
+	if _, ok := nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]; !ok {
+		// Only a completed migration's marker lacks requested-at, and its slot is already in EC2's count.
+		return false, nil
+	}
+	if !c.stalled(p, nc, inst.ID, target) {
+		p.hold(target, inst.ID)
 	}
 	return false, nil
 }
 
+// trackedTarget returns the NodeClaim's migration target unless it is a completed migration's marker that still matches its labels.
+func trackedTarget(nc *karpv1.NodeClaim) string {
+	target := nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget]
+	if nc.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved && nc.Labels[cloudprovider.ReservationIDLabel] == target {
+		return ""
+	}
+	return target
+}
+
 // holdUncovered holds a slot for an instance we won't relabel whose live target will still cover it once a slot frees.
-func (c *Controller) holdUncovered(ctx context.Context, p *pass, inst *instance.Instance) error {
+func (c *Controller) holdUncovered(ctx context.Context, p *pass, nc *karpv1.NodeClaim, inst *instance.Instance) error {
 	state := inst.CapacityReservationState
-	if state.TargetID == "" || state.CoveringID != "" {
+	if state.TargetID == "" {
 		return nil
 	}
-	active, err := c.isActive(ctx, p, state.TargetID)
-	if active {
+	if state.CoveringID != "" {
+		if s := (slot{instanceID: inst.ID, reservationID: state.TargetID}); state.CoveringID == state.TargetID && !c.covered.Has(s) {
+			// EC2's count may not include the slot this held until a sync after this sweep.
+			c.crProvider.MarkMigrated(state.TargetID, inst.ID, p.observed)
+			c.covered.Insert(s)
+		}
+		return nil
+	}
+	active, err := c.isActive(ctx, p, nc, state.TargetID)
+	if active && !c.stalled(p, nc, inst.ID, state.TargetID) {
 		p.hold(state.TargetID, inst.ID)
 	}
 	return err
+}
+
+// stalled reports whether the instance has waited for coverage by id past stallThreshold, so its hold only blocks launches.
+// EC2 covers a re-target as soon as a slot is free, so a hold that old is released with a Stalled event.
+func (c *Controller) stalled(p *pass, nc *karpv1.NodeClaim, instanceID, id string) bool {
+	if id == "" {
+		return false
+	}
+	s := slot{instanceID: instanceID, reservationID: id}
+	since, err := time.Parse(time.RFC3339, nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt])
+	if nc.Annotations[v1.AnnotationCapacityReservationMigrationTarget] != id || err != nil {
+		p.waiting.Insert(s)
+		if _, ok := c.pendingSince[s]; !ok {
+			c.pendingSince[s] = p.start
+		}
+		since = c.pendingSince[s]
+	}
+	pendingFor := c.clk.Since(since)
+	if pendingFor <= stallThreshold {
+		return false
+	}
+	if !p.stalled.Has(s) {
+		p.stalled.Insert(s)
+		c.recorder.Publish(stalledEvent(nc, id, pendingFor))
+	}
+	return true
 }
 
 func (c *Controller) withinGrace(nc *karpv1.NodeClaim) bool {
@@ -323,7 +440,7 @@ func (c *Controller) relabelable(ctx context.Context, p *pass, nc *karpv1.NodeCl
 	if err != nil || nodeClass == nil || !adoptable(nodeClass, id) {
 		return false, err
 	}
-	if active, err := c.isActive(ctx, p, id); err != nil || !active {
+	if active, err := c.isActive(ctx, p, nc, id); err != nil || !active {
 		return false, err
 	}
 	nodes, err := nodeclaimutils.AllNodesForNodeClaim(ctx, c.kubeClient, nc)
@@ -334,7 +451,9 @@ func (c *Controller) relabelable(ctx context.Context, p *pass, nc *karpv1.NodeCl
 	return len(ids) != 0, err
 }
 
-// complete relabels a covered node reserved. The Nodes go first so a failed NodeClaim patch retries both.
+// complete relabels a covered node reserved. The NodeClaim goes first, since capacitytype syncs a reserved NodeClaim's Nodes.
+//
+//nolint:gocyclo
 func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim, inst *instance.Instance, target string) error {
 	nodes, err := nodeclaimutils.AllNodesForNodeClaim(ctx, c.kubeClient, nc)
 	if err != nil {
@@ -344,25 +463,43 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 	if err != nil {
 		return err
 	}
-	reason := ""
 	if nodeClass == nil || !adoptable(nodeClass, target) {
-		reason = "the reservation is no longer selected by the EC2NodeClass"
-	} else if ids, why, err := c.filterCompatible(ctx, p, nc, nodes, []string{target}); err != nil {
-		return err
-	} else if len(ids) == 0 {
-		reason = lo.Ternary(why == "", "the NodePool is gone", strings.ReplaceAll(why, "_", " "))
-	}
-	if reason != "" {
-		// The move can't be undone, so leave the labels on-demand; adoption relabels it once it is compatible.
+		// Like an open ODCR match, an unselected reservation stays on-demand; adoption relabels it if it is selected again.
 		if err := c.clearTarget(ctx, nc); err != nil {
 			return err
 		}
-		c.crProvider.MarkMigrated(target, inst.ID)
+		c.crProvider.MarkMigrated(target, inst.ID, p.observed)
 		delete(c.cases, inst.ID)
-		c.recorder.Publish(notRelabeledEvent(nc, target, reason))
+		c.recorder.Publish(notRelabeledEvent(nc, target, lo.Ternary(nodeClass == nil, "the EC2NodeClass is gone", "the reservation is no longer selected by the EC2NodeClass")))
 		return nil
 	}
+	// The move can't be undone, so the labels follow EC2 even if the NodePool or a pod now rejects them.
+	ids, why, err := c.filterCompatible(ctx, p, nc, nodes, []string{target})
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		why = lo.Ternary(why == "" && nc.Labels[karpv1.NodePoolLabelKey] == "", whyNoNodePool, why)
+		c.recorder.Publish(incompatibleEvent(nc, target, incompatibleReasons[why]))
+	}
 	labels := reservedLabels(target)
+	stored := nc.DeepCopy()
+	nc.Labels = lo.Assign(nc.Labels, labels)
+	requestedAt := nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]
+	// The target stays as a marker, so a demotion from a stale DescribeInstances is relabeled once coverage shows again.
+	delete(nc.Annotations, v1.AnnotationCapacityReservationMigrationRequestedAt)
+	if err := c.kubeClient.Patch(ctx, nc, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+		return client.IgnoreNotFound(fmt.Errorf("patching nodeclaim, %w", err))
+	}
+	// Even an adoption may have been covered after the cache's last sync.
+	c.crProvider.MarkMigrated(target, inst.ID, p.observed)
+	if t, err := time.Parse(time.RFC3339, requestedAt); err == nil {
+		MigrationCoverageDurationSeconds.Observe(c.clk.Since(t).Seconds(), map[string]string{})
+		MigrationCompletedTotal.Inc(map[string]string{caseLabel.Name: lo.ValueOr(c.cases, inst.ID, caseOnDemand)})
+		c.recorder.Publish(completedEvent(nc, target))
+	}
+	delete(c.cases, inst.ID)
+	log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Info("migrated node into capacity reservation")
 	for _, node := range nodes {
 		if !node.DeletionTimestamp.IsZero() || node.Labels[karpv1.NodeRegisteredLabelKey] != "true" {
 			continue
@@ -373,24 +510,16 @@ func (c *Controller) complete(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 			return fmt.Errorf("patching node, %w", err)
 		}
 	}
-	stored := nc.DeepCopy()
-	nc.Labels = lo.Assign(nc.Labels, labels)
-	requestedAt := nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt]
-	delete(nc.Annotations, v1.AnnotationCapacityReservationMigrationTarget)
-	delete(nc.Annotations, v1.AnnotationCapacityReservationMigrationRequestedAt)
-	if err := c.kubeClient.Patch(ctx, nc, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
-		return client.IgnoreNotFound(fmt.Errorf("patching nodeclaim, %w", err))
-	}
-	// EC2's count now includes this instance, but our cache won't until its next sync.
-	c.crProvider.MarkMigrated(target, inst.ID)
-	if t, err := time.Parse(time.RFC3339, requestedAt); err == nil {
-		MigrationCoverageDurationSeconds.Observe(c.clk.Since(t).Seconds(), map[string]string{})
-	}
-	MigrationCompletedTotal.Inc(map[string]string{caseLabel.Name: lo.ValueOr(c.cases, inst.ID, caseOnDemand)})
-	delete(c.cases, inst.ID)
-	c.recorder.Publish(completedEvent(nc, target))
-	log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Info("migrated node into capacity reservation")
 	return nil
+}
+
+const whyNoNodePool = "no_nodepool"
+
+var incompatibleReasons = map[string]string{
+	"":                         "its NodePool is gone",
+	whyNoNodePool:              "it has no NodePool",
+	reasonNodePoolIncompatible: "its NodePool no longer allows it",
+	reasonPodIncompatible:      "a pod on it requires other labels",
 }
 
 // adoptable reports whether id is a reservation the controller could have chosen, so the labels it writes are accurate.
@@ -412,7 +541,7 @@ func reservedLabels(reservationID string) map[string]string {
 // eligible returns the NodeClaim as a migration candidate with its compatible reservations, or nil if it can't move.
 //
 //nolint:gocyclo
-func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim, byID map[string]*instance.Instance) (*candidate, error) {
+func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim, inst *instance.Instance) (*candidate, error) {
 	if nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand {
 		return nil, nil
 	}
@@ -421,9 +550,7 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		!nc.StatusConditions().Get(karpv1.ConditionTypeInitialized).IsTrue() {
 		return nil, nil
 	}
-	id := lo.Must(utils.ParseInstanceID(nc.Status.ProviderID))
-	inst := byID[id]
-	if b, ok := c.backoff[id]; ok && c.clk.Now().Before(b.next) {
+	if b, ok := c.backoff[inst.ID]; ok && c.clk.Now().Before(b.next) {
 		return nil, nil
 	}
 	state := inst.CapacityReservationState
@@ -432,12 +559,17 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		state.Lifecycle == ec2types.InstanceLifecycleTypeSpot || state.CoveringID != "" {
 		return nil, nil
 	}
+	// Modify is refused in a shifted zone, so don't annotate and fail every pass.
+	if inst.ZoneID != "" && c.zonalShift.IsZonalShifted(ctx, inst.ZoneID) {
+		p.ineligible[reasonZonalShift]++
+		return nil, nil
+	}
 	var migrationCase string
 	switch {
 	case state.TargetID == "" && state.Preference == ec2types.CapacityReservationPreferenceNone:
 		migrationCase = caseOnDemand
 	case state.TargetID != "":
-		active, err := c.isActive(ctx, p, state.TargetID)
+		active, err := c.isActive(ctx, p, nc, state.TargetID)
 		if err != nil {
 			return nil, err
 		}
@@ -452,23 +584,24 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		return nil, nil
 	}
 
-	node, err := nodeclaimutils.NodeForNodeClaim(ctx, c.kubeClient, nc)
-	if err != nil {
-		return nil, client.IgnoreNotFound(nodeclaimutils.IgnoreNodeNotFoundError(nodeclaimutils.IgnoreDuplicateNodeError(err)))
-	}
-	if !node.DeletionTimestamp.IsZero() || lo.ContainsBy(node.Spec.Taints, func(t corev1.Taint) bool { return t.MatchTaint(&karpv1.DisruptedNoScheduleTaint) }) {
-		return nil, nil
-	}
 	nodeClass, err := c.nodeClass(ctx, p, nc)
-	if err != nil || nodeClass == nil {
+	// Launches treat a deleting EC2NodeClass as gone, so don't spend reservation slots on its nodes.
+	if err != nil || nodeClass == nil || !nodeClass.DeletionTimestamp.IsZero() {
 		return nil, err
 	}
-	reservations, err := c.compatibleReservations(ctx, p, nodeClass, inst, state.TargetID)
+	reservations, endTimes, err := c.compatibleReservations(ctx, p, nodeClass, inst, state.TargetID)
 	if err != nil {
 		return nil, err
 	}
 	if len(reservations) == 0 {
 		p.ineligible[reasonNoCompatibleCR]++
+		return nil, nil
+	}
+	node, err := nodeclaimutils.NodeForNodeClaim(ctx, c.kubeClient, nc)
+	if err != nil {
+		return nil, client.IgnoreNotFound(nodeclaimutils.IgnoreNodeNotFoundError(nodeclaimutils.IgnoreDuplicateNodeError(err)))
+	}
+	if !node.DeletionTimestamp.IsZero() || lo.ContainsBy(node.Spec.Taints, func(t corev1.Taint) bool { return t.MatchTaint(&karpv1.DisruptedNoScheduleTaint) }) {
 		return nil, nil
 	}
 	reservations, reason, err := c.filterCompatible(ctx, p, nc, []*corev1.Node{node}, reservations)
@@ -481,7 +614,7 @@ func (c *Controller) eligible(ctx context.Context, p *pass, nc *karpv1.NodeClaim
 		}
 		return nil, nil
 	}
-	return &candidate{nodeClaim: nc, node: node, instance: inst, caseLabel: migrationCase, reservations: reservations}, nil
+	return &candidate{nodeClaim: nc, instance: inst, caseLabel: migrationCase, reservations: reservations, endTimes: endTimes}, nil
 }
 
 // filterCompatible keeps the reservations whose labels neither the NodePool nor any pod on the nodes rejects, else returns why.
@@ -520,24 +653,21 @@ func (c *Controller) filterCompatible(ctx context.Context, p *pass, nc *karpv1.N
 	return ids, "", nil
 }
 
-// compatibleReservations returns the NodeClass's reservations the instance can be re-targeted at, ignoring capacity.
+// compatibleReservations returns the NodeClass's reservations the instance can be re-targeted at, ignoring capacity,
+// with their end times.
 //
 //nolint:gocyclo
-func (c *Controller) compatibleReservations(ctx context.Context, p *pass, nodeClass *v1.EC2NodeClass, inst *instance.Instance, source string) ([]string, error) {
-	raw, ok := p.raw[nodeClass.Name]
-	if !ok {
-		reservations, err := c.crProvider.List(ctx, nodeClass.Spec.CapacityReservationSelectorTerms...)
-		if err != nil {
-			return nil, fmt.Errorf("listing capacity reservations, %w", err)
-		}
-		raw = lo.KeyBy(reservations, func(r *ec2types.CapacityReservation) string { return lo.FromPtr(r.CapacityReservationId) })
-		p.raw[nodeClass.Name] = raw
+func (c *Controller) compatibleReservations(ctx context.Context, p *pass, nodeClass *v1.EC2NodeClass, inst *instance.Instance, source string) ([]string, map[string]time.Time, error) {
+	raw, err := c.selected(ctx, p, nodeClass)
+	if err != nil {
+		return nil, nil, err
 	}
 	// An unknown platform could pick a reservation EC2 won't match, and the move can't be undone.
 	if inst.CapacityReservationState.Platform == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
-	return lo.FilterMap(nodeClass.Status.CapacityReservations, func(cr v1.CapacityReservation, _ int) (string, bool) {
+	endTimes := map[string]time.Time{}
+	ids := lo.FilterMap(nodeClass.Status.CapacityReservations, func(cr v1.CapacityReservation, _ int) (string, bool) {
 		if cr.ReservationType != v1.CapacityReservationTypeDefault || cr.Interruptible || cr.State != v1.CapacityReservationStateActive ||
 			cr.InstanceType != string(inst.Type) || cr.AvailabilityZone != inst.Zone || cr.ID == source {
 			return "", false
@@ -549,12 +679,50 @@ func (c *Controller) compatibleReservations(ctx context.Context, p *pass, nodeCl
 			string(lo.Ternary(r.Tenancy == "", ec2types.CapacityReservationTenancyDefault, r.Tenancy)) != inst.Tenancy {
 			return "", false
 		}
+		if end := lo.FromPtr(r.EndDate); !end.IsZero() {
+			if end.Sub(c.clk.Now()) < minReservationRemaining {
+				return "", false
+			}
+			endTimes[cr.ID] = end
+		}
 		return cr.ID, true
-	}), nil
+	})
+	return ids, endTimes, nil
+}
+
+// selected returns the active reservations the NodeClass's selector terms match, keyed by ID.
+func (c *Controller) selected(ctx context.Context, p *pass, nodeClass *v1.EC2NodeClass) (map[string]*ec2types.CapacityReservation, error) {
+	if raw, ok := p.raw[nodeClass.Name]; ok {
+		return raw, nil
+	}
+	key := "nodeclass/" + nodeClass.Name
+	if err, ok := p.failed[key]; ok {
+		return nil, err
+	}
+	reservations, err := c.crProvider.List(ctx, nodeClass.Spec.CapacityReservationSelectorTerms...)
+	if err != nil {
+		p.failed[key] = fmt.Errorf("listing capacity reservations, %w", err)
+		return nil, p.failed[key]
+	}
+	raw := lo.KeyBy(reservations, func(r *ec2types.CapacityReservation) string { return lo.FromPtr(r.CapacityReservationId) })
+	p.raw[nodeClass.Name] = raw
+	return raw, nil
+}
+
+// preferred orders reservations that never end first, then by latest end, then by most free slots, then by ID.
+func preferred(a, b string, endTimes map[string]time.Time, budgets map[string]int) bool {
+	ea, eb := endTimes[a], endTimes[b]
+	if !ea.Equal(eb) {
+		return ea.IsZero() || (!eb.IsZero() && ea.After(eb))
+	}
+	if budgets[a] != budgets[b] {
+		return budgets[a] > budgets[b]
+	}
+	return a < b
 }
 
 //nolint:gocyclo
-func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candidate) []error {
+func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candidate) (int, []error) {
 	var errs []error
 	calls := 0
 	for _, cand := range candidates {
@@ -562,31 +730,58 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			break
 		}
 		// The ledger-adjusted count already excludes slots claimed earlier in this pass.
-		budgets := lo.SliceToMap(cand.reservations, func(id string) (string, int) { return id, c.crProvider.GetAvailableInstanceCount(id) })
+		budgets := lo.SliceToMap(cand.reservations, func(id string) (string, int) {
+			return id, c.crProvider.GetAvailableInstanceCount(id) - p.launching[id]
+		})
 		reservations := lo.Filter(cand.reservations, func(id string, _ int) bool { return budgets[id] > 0 })
 		if len(reservations) == 0 {
 			p.ineligible[reasonNoCapacity]++
 			continue
 		}
-		sort.SliceStable(reservations, func(i, j int) bool {
-			if budgets[reservations[i]] != budgets[reservations[j]] {
-				return budgets[reservations[i]] > budgets[reservations[j]]
-			}
-			return reservations[i] < reservations[j]
-		})
-		target := reservations[0]
 		nc, inst := cand.nodeClaim, cand.instance
+		reservations = lo.Reject(reservations, func(id string, _ int) bool {
+			return c.clk.Now().Before(c.unauthorized[id]) || c.clk.Now().Before(c.denied[slot{instanceID: inst.ID, reservationID: id}].next)
+		})
+		if len(reservations) == 0 {
+			p.ineligible[reasonUnauthorized]++
+			continue
+		}
+		target := lo.MinBy(reservations, func(a, b string) bool { return preferred(a, b, cand.endTimes, budgets) })
 		// Record intent first so a crash after the call still leaves durable state for the ledger.
-		if err := c.setTarget(ctx, nc, target); err != nil {
-			errs = append(errs, client.IgnoreNotFound(err))
+		if err := c.setTarget(ctx, nc, target, true); err != nil {
+			errs = append(errs, client.IgnoreNotFound(serrors.Wrap(err, "NodeClaim", klog.KObj(nc))))
+			continue
+		}
+		err := c.instanceProvider.ModifyCapacityReservationTarget(ctx, inst.ID, target)
+		if stderrors.Is(err, instance.ErrModifyNotAttempted) {
+			// Nothing reached EC2, so skip the instance this pass without counting an attempt.
+			log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc)).V(1).Info("skipping capacity reservation migration", "error", err.Error())
+			if clearErr := c.clearTarget(ctx, nc); clearErr != nil {
+				errs = append(errs, serrors.Wrap(clearErr, "NodeClaim", klog.KObj(nc)))
+			}
+			if awserrors.IsRateLimitedError(err) {
+				return calls, errs
+			}
 			continue
 		}
 		calls++
-		err := c.instanceProvider.ModifyCapacityReservationTarget(ctx, inst.ID, target)
+		if unsupportedInRegion(err) {
+			if clearErr := c.clearTarget(ctx, nc); clearErr != nil {
+				errs = append(errs, serrors.Wrap(clearErr, "NodeClaim", klog.KObj(nc)))
+			}
+			c.unsupported = backoffEntry{delay: lo.Ternary(c.unsupported.delay == 0, unsupportedBackoff, min(c.unsupported.delay*2, maxUnsupportedBackoff))}
+			c.unsupported.next = c.clk.Now().Add(c.unsupported.delay)
+			log.FromContext(ctx).WithValues("retry-after", c.unsupported.delay).Info("EC2 doesn't support re-targeting running instances at capacity reservations in this region yet, pausing migration")
+			return calls, errs
+		}
 		if err == nil {
+			c.unsupported = backoffEntry{}
 			p.hold(target, inst.ID)
 			c.crProvider.SetPendingMigrations(p.pending)
 			delete(c.backoff, inst.ID)
+			delete(c.denied, slot{instanceID: inst.ID, reservationID: target})
+			delete(c.deniedBy, target)
+			delete(c.unauthorized, target)
 			c.cases[inst.ID] = cand.caseLabel
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultSuccess, caseLabel.Name: cand.caseLabel})
 			c.recorder.Publish(startedEvent(nc, target))
@@ -601,43 +796,47 @@ func (c *Controller) migrate(ctx context.Context, p *pass, candidates []*candida
 			c.backOff(inst.ID)
 			c.recorder.Publish(failedEvent(nc, target, err))
 			log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Error(err, "failed re-targeting instance at capacity reservation, outcome unknown")
-			return errs
+			return calls, errs
 		}
 		if clearErr := c.clearTarget(ctx, nc); clearErr != nil {
-			errs = append(errs, clearErr)
+			errs = append(errs, serrors.Wrap(clearErr, "NodeClaim", klog.KObj(nc)))
 		}
 		switch {
 		case cloudprovider.IsNodeClaimNotFoundError(err):
 			continue
 		case awserrors.IsUnauthorizedOperationError(err):
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultUnauthorized, caseLabel.Name: cand.caseLabel})
-			if c.clk.Since(c.unauthorizedLogs) > unauthorizedLogInterval {
-				c.unauthorizedLogs = c.clk.Now()
-				log.FromContext(ctx).Error(err, "missing permission ec2:ModifyInstanceCapacityReservationAttributes, skipping capacity reservation migration")
-			}
-			return errs
+			c.deny(inst.ID, target)
+			log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Error(err,
+				"not authorized for ec2:ModifyInstanceCapacityReservationAttributes, skipping capacity reservation for this instance")
 		case awserrors.IsRateLimitedError(err):
 			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultThrottled, caseLabel.Name: cand.caseLabel})
-			return errs
+			return calls, errs
 		default:
-			_, isAPIErr := lo.ErrorsAs[smithy.APIError](err)
-			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: lo.Ternary(isAPIErr, resultClientError, resultError), caseLabel.Name: cand.caseLabel})
+			MigrationAttemptsTotal.Inc(map[string]string{resultLabel.Name: resultClientError, caseLabel.Name: cand.caseLabel})
 			c.backOff(inst.ID)
 			c.recorder.Publish(failedEvent(nc, target, err))
 			log.FromContext(ctx).WithValues("NodeClaim", client.ObjectKeyFromObject(nc), "capacity-reservation-id", target).Error(err, "failed re-targeting instance at capacity reservation")
 		}
 	}
-	return errs
+	return calls, errs
+}
+
+// unsupportedInRegion reports whether EC2 refused to re-target a running instance because the Region only allows stopped ones.
+func unsupportedInRegion(err error) bool {
+	apiErr, ok := lo.ErrorsAs[smithy.APIError](err)
+	return ok && apiErr.ErrorCode() == "IncorrectInstanceState" && strings.Contains(apiErr.ErrorMessage(), "allowed state: stopped")
 }
 
 // ambiguous reports whether a failed Modify may still have been applied by EC2.
 func ambiguous(err error) bool {
-	if stderrors.Is(err, instance.ErrModifyNotAttempted) || cloudprovider.IsNodeClaimNotFoundError(err) ||
+	if cloudprovider.IsNodeClaimNotFoundError(err) ||
 		awserrors.IsUnauthorizedOperationError(err) || awserrors.IsRateLimitedError(err) {
 		return false
 	}
 	apiErr, ok := lo.ErrorsAs[smithy.APIError](err)
 	if !ok {
+		// A transport error (timeout, reset, canceled context) carries no EC2 verdict, so the call may have landed.
 		return true
 	}
 	if resp, ok := lo.ErrorsAs[interface {
@@ -647,6 +846,37 @@ func ambiguous(err error) bool {
 		return true
 	}
 	return serverErrorCodes.Has(apiErr.ErrorCode())
+}
+
+// holdLaunch keeps migration off slots the scheduler gave an un-launched NodeClaim; Create only counts it once launched.
+func (p *pass) holdLaunch(nc *karpv1.NodeClaim) {
+	if !nc.DeletionTimestamp.IsZero() {
+		return
+	}
+	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nc.Spec.Requirements...)
+	if !reqs.Has(karpv1.CapacityTypeLabelKey) || !reqs.Has(cloudprovider.ReservationIDLabel) ||
+		!reqs.Get(karpv1.CapacityTypeLabelKey).Has(karpv1.CapacityTypeReserved) || reqs.Get(karpv1.CapacityTypeLabelKey).Len() != 1 {
+		return
+	}
+	// The launch may land in any of the offered reservations, so hold one slot in each.
+	for _, id := range reqs.Get(cloudprovider.ReservationIDLabel).Values() {
+		p.launching[id]++
+	}
+}
+
+// holdOrCovered holds the instance's slot in target, unless EC2 already counts it there; then it is held only until the next sync.
+func (c *Controller) holdOrCovered(p *pass, nc *karpv1.NodeClaim, target string, inst *instance.Instance) {
+	if target == "" || inst.CapacityReservationState.CoveringID != target {
+		// EC2 only covers the instance with its live target, though DescribeInstances can lag a Modify.
+		if (inst.CapacityReservationState.TargetID == target || c.withinGrace(nc)) && !c.stalled(p, nc, inst.ID, target) {
+			p.hold(target, inst.ID)
+		}
+		return
+	}
+	if s := (slot{instanceID: inst.ID, reservationID: target}); !c.covered.Has(s) {
+		c.crProvider.MarkMigrated(target, inst.ID, p.observed)
+		c.covered.Insert(s)
+	}
 }
 
 func (p *pass) hold(target, instanceID string) {
@@ -659,12 +889,29 @@ func (p *pass) hold(target, instanceID string) {
 	p.pending[target].Insert(instanceID)
 }
 
-func (c *Controller) backOff(instanceID string) {
-	delay := initialBackoff
-	if b, ok := c.backoff[instanceID]; ok {
-		delay = min(b.delay*2, maxBackoff)
+// deny backs off the instance from the reservation, and the whole reservation once a second instance is denied,
+// since the shipped policy scopes the permission by instance tags.
+func (c *Controller) deny(instanceID, reservationID string) {
+	s := slot{instanceID: instanceID, reservationID: reservationID}
+	c.denied[s] = c.nextBackoff(c.denied[s])
+	if c.deniedBy[reservationID] == nil {
+		c.deniedBy[reservationID] = sets.New[string]()
 	}
-	c.backoff[instanceID] = backoffEntry{next: c.clk.Now().Add(delay), delay: delay}
+	c.deniedBy[reservationID].Insert(instanceID)
+	if c.deniedBy[reservationID].Len() >= 2 {
+		// Fixed, so per-instance backoff outgrows it and repeatedly denied instances stop crowding out the rest.
+		c.unauthorized[reservationID] = c.clk.Now().Add(initialBackoff)
+		delete(c.deniedBy, reservationID)
+	}
+}
+
+func (c *Controller) backOff(instanceID string) {
+	c.backoff[instanceID] = c.nextBackoff(c.backoff[instanceID])
+}
+
+func (c *Controller) nextBackoff(b backoffEntry) backoffEntry {
+	delay := lo.Ternary(b.delay == 0, initialBackoff, min(b.delay*2, maxBackoff))
+	return backoffEntry{next: c.clk.Now().Add(delay), delay: delay}
 }
 
 func (c *Controller) prune(instances map[string]*instance.Instance) {
@@ -678,14 +925,46 @@ func (c *Controller) prune(instances map[string]*instance.Instance) {
 			delete(c.cases, id)
 		}
 	}
+	for s := range c.covered {
+		if _, ok := instances[s.instanceID]; !ok {
+			c.covered.Delete(s)
+		}
+	}
+	c.pruneDenials(instances)
 }
 
-func (c *Controller) setTarget(ctx context.Context, nc *karpv1.NodeClaim, target string) error {
+func (c *Controller) pruneDenials(instances map[string]*instance.Instance) {
+	for s, b := range c.denied {
+		if _, ok := instances[s.instanceID]; !ok || c.clk.Since(b.next) > maxBackoff {
+			delete(c.denied, s)
+		}
+	}
+	for id, instanceIDs := range c.deniedBy {
+		for instanceID := range instanceIDs {
+			if _, ok := c.denied[slot{instanceID: instanceID, reservationID: id}]; !ok {
+				instanceIDs.Delete(instanceID)
+			}
+		}
+		if instanceIDs.Len() == 0 {
+			delete(c.deniedBy, id)
+		}
+	}
+	for id, until := range c.unauthorized {
+		if !c.clk.Now().Before(until) {
+			delete(c.unauthorized, id)
+		}
+	}
+}
+
+// setTarget records target; requested-at marks a move still waiting for coverage, so an already-covered adoption omits it.
+func (c *Controller) setTarget(ctx context.Context, nc *karpv1.NodeClaim, target string, pending bool) error {
 	stored := nc.DeepCopy()
-	nc.Annotations = lo.Assign(nc.Annotations, map[string]string{
-		v1.AnnotationCapacityReservationMigrationTarget:      target,
-		v1.AnnotationCapacityReservationMigrationRequestedAt: c.clk.Now().UTC().Format(time.RFC3339),
-	})
+	nc.Annotations = lo.Assign(nc.Annotations, map[string]string{v1.AnnotationCapacityReservationMigrationTarget: target})
+	if pending {
+		nc.Annotations[v1.AnnotationCapacityReservationMigrationRequestedAt] = c.clk.Now().UTC().Format(time.RFC3339)
+	} else {
+		delete(nc.Annotations, v1.AnnotationCapacityReservationMigrationRequestedAt)
+	}
 	if err := c.kubeClient.Patch(ctx, nc, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 		return fmt.Errorf("annotating nodeclaim, %w", err)
 	}
@@ -703,13 +982,33 @@ func (c *Controller) clearTarget(ctx context.Context, nc *karpv1.NodeClaim) erro
 }
 
 // isActive reports whether a reservation is still active; List returns active, unexpired reservations only.
-func (c *Controller) isActive(ctx context.Context, p *pass, id string) (bool, error) {
+func (c *Controller) isActive(ctx context.Context, p *pass, nc *karpv1.NodeClaim, id string) (bool, error) {
 	if active, ok := p.active[id]; ok {
 		return active, nil
 	}
+	// The NodeClass's selector query is usually cached, so check it before a by-ID call.
+	nodeClass, err := c.nodeClass(ctx, p, nc)
+	if err != nil {
+		return false, err
+	}
+	if nodeClass != nil {
+		raw, err := c.selected(ctx, p, nodeClass)
+		if err != nil {
+			return false, err
+		}
+		if _, ok := raw[id]; ok {
+			p.active[id] = true
+			return true, nil
+		}
+	}
+	key := "id/" + id
+	if err, ok := p.failed[key]; ok {
+		return false, err
+	}
 	reservations, err := c.crProvider.List(ctx, v1.CapacityReservationSelectorTerm{ID: id})
 	if err != nil {
-		return false, fmt.Errorf("getting capacity reservation, %w", err)
+		p.failed[key] = fmt.Errorf("getting capacity reservation, %w", err)
+		return false, p.failed[key]
 	}
 	p.active[id] = lo.ContainsBy(reservations, func(r *ec2types.CapacityReservation) bool { return lo.FromPtr(r.CapacityReservationId) == id })
 	return p.active[id], nil
@@ -758,8 +1057,8 @@ func (c *Controller) publishGauges(p *pass) {
 		MigrationPending.Set(float64(instances.Len()), map[string]string{reservationIDLabel.Name: id})
 	}
 	MigrationIneligible.Reset()
-	for _, reason := range []string{reasonPreferenceOpen, reasonPodIncompatible, reasonNodePoolIncompatible, reasonNoCapacity, reasonNoCompatibleCR} {
-		MigrationIneligible.Set(float64(p.ineligible[reason]), map[string]string{reasonLabel.Name: reason})
+	for _, reason := range reasonLabel.Values {
+		MigrationIneligible.Set(float64(p.ineligible[reason.Name]), map[string]string{reasonLabel.Name: reason.Name})
 	}
-	MigrationStalled.Set(float64(p.stalled), map[string]string{})
+	MigrationStalled.Set(float64(p.stalled.Len()), map[string]string{})
 }

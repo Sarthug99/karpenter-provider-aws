@@ -1091,7 +1091,7 @@ Number of pending nodes whose coverage has taken longer than 30 minutes.
 - Stability Level: ALPHA
 
 ### `karpenter_capacity_reservation_migration_pending`
-Number of nodes re-targeted at a capacity reservation that EC2 doesn't report covered yet.
+Number of nodes re-targeted at a capacity reservation that EC2 doesn't report covered yet, excluding stalled ones.
 - Type: [Gauge](https://prometheus.io/docs/concepts/metric_types/#gauge)
 - Stability Level: ALPHA
 - Dimensions:
@@ -1108,6 +1108,8 @@ Number of on-demand or orphaned nodes not migrated in the last pass, by reason.
     - `nodepool_incompatible` — The NodePool requirements don't allow the reserved labels.
     - `no_capacity` — Every compatible capacity reservation is full.
     - `no_compatible_cr` — No capacity reservation selected by the EC2NodeClass matches the instance.
+    - `zonal_shift` — The instance's availability zone is zonally shifted away from.
+    - `unauthorized` — EC2 denied moving the instance into every compatible capacity reservation with a free slot, so they are backing off.
 
 ### `karpenter_capacity_reservation_migration_coverage_duration_seconds`
 Time from re-targeting a node at a capacity reservation to EC2 reporting it covered.
@@ -1131,7 +1133,7 @@ Number of ModifyInstanceCapacityReservationAttributes calls made to move a runni
   - `result` — The outcome of the ModifyInstanceCapacityReservationAttributes call.
     - `success` — EC2 accepted the new target.
     - `client_error` — EC2 rejected the request, e.g. the transition or target is not allowed.
-    - `unauthorized` — The controller role lacks ec2:ModifyInstanceCapacityReservationAttributes.
+    - `unauthorized` — EC2 denied ec2:ModifyInstanceCapacityReservationAttributes for the instance or target capacity reservation.
     - `throttled` — EC2 throttled the request.
     - `error` — Any other error.
   - `case` — Why the node is being migrated.

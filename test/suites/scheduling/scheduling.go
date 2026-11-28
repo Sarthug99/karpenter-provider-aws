@@ -19,10 +19,12 @@ import (
 	"fmt"
 	"math/rand"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	arczonalshiftservice "github.com/aws/aws-sdk-go-v2/service/arczonalshift"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
 	"github.com/awslabs/operatorpkg/object"
@@ -34,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -980,6 +983,149 @@ func RegisterTests(minValuesPolicy options.MinValuesPolicy) bool {
 				}
 				Expect(reservedCount).To(Equal(1))
 				Env.EventuallyExpectNodeCount("==", 2)
+			})
+		})
+
+		Context("Capacity Reservation Migration", Label("needs:capacity-reservation"), func() {
+			enableMigration := func() {
+				GinkgoHelper()
+				gates, _ := lo.Find(Env.ExpectSettings(), func(v corev1.EnvVar) bool { return v.Name == "AWS_FEATURE_GATES" })
+				Env.ExpectSettingsOverridden(corev1.EnvVar{Name: "AWS_FEATURE_GATES", Value: strings.TrimPrefix(gates.Value+",ReservedCapacityMigration=true", ",")})
+			}
+			offeringRequirements := func(cr environmentaws.CapacityReservation, capacityTypes ...string) []corev1.NodeSelectorRequirement {
+				reqs := []corev1.NodeSelectorRequirement{
+					{Key: corev1.LabelInstanceTypeStable, Operator: corev1.NodeSelectorOpIn, Values: []string{cr.InstanceType}},
+					{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{cr.Zone}},
+				}
+				if len(capacityTypes) != 0 {
+					reqs = append(reqs, corev1.NodeSelectorRequirement{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: capacityTypes})
+				}
+				return reqs
+			}
+			describeInstance := func(g Gomega, id string) ec2types.Instance {
+				out, err := Env.EC2API.DescribeInstances(Env.Context, &ec2.DescribeInstancesInput{InstanceIds: []string{id}})
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(out.Reservations).To(HaveLen(1))
+				g.Expect(out.Reservations[0].Instances).To(HaveLen(1))
+				return out.Reservations[0].Instances[0]
+			}
+			expectMigrated := func(nodeClaim *karpv1.NodeClaim, node *corev1.Node, reservationID string) {
+				GinkgoHelper()
+				instanceID := Env.ExpectParsedProviderID(node.Spec.ProviderID)
+				Eventually(func(g Gomega) {
+					nc := &karpv1.NodeClaim{}
+					g.Expect(Env.Client.Get(Env, client.ObjectKeyFromObject(nodeClaim), nc)).To(Succeed())
+					g.Expect(nc.UID).To(Equal(nodeClaim.UID))
+					g.Expect(nc.Status.ProviderID).To(Equal(node.Spec.ProviderID))
+					g.Expect(nc.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
+					g.Expect(nc.Labels).To(HaveKeyWithValue(v1.LabelCapacityReservationID, reservationID))
+					g.Expect(nc.Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationRequestedAt))
+
+					n := &corev1.Node{}
+					g.Expect(Env.Client.Get(Env, client.ObjectKeyFromObject(node), n)).To(Succeed())
+					g.Expect(n.UID).To(Equal(node.UID))
+					g.Expect(n.Spec.ProviderID).To(Equal(node.Spec.ProviderID))
+					g.Expect(n.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
+					g.Expect(n.Labels).To(HaveKeyWithValue(v1.LabelCapacityReservationID, reservationID))
+					g.Expect(n.Labels).To(HaveKeyWithValue(v1.LabelCapacityReservationType, string(v1.CapacityReservationTypeDefault)))
+
+					g.Expect(lo.FromPtr(describeInstance(g, instanceID).CapacityReservationId)).To(Equal(reservationID))
+				}).Should(Succeed())
+			}
+			BeforeEach(func() {
+				NodePool.Spec.Template.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{
+					{
+						Key:      karpv1.CapacityTypeLabelKey,
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   []string{karpv1.CapacityTypeOnDemand, karpv1.CapacityTypeReserved},
+					},
+					{
+						Key:      corev1.LabelOSStable,
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   []string{string(corev1.Linux)},
+					},
+				}
+			})
+			It("should migrate a running on-demand node into a newly selected capacity reservation in place", func() {
+				cr := Env.ExpectCapacityReservationCreated(1)
+				DeferCleanup(func() {
+					environmentaws.ExpectCapacityReservationsCanceled(Env.Context, Env.EC2API, cr.ID)
+				})
+				pod := test.Pod(test.PodOptions{NodeRequirements: offeringRequirements(cr)})
+				Env.ExpectCreated(NodePool, NodeClass, pod)
+				Env.EventuallyExpectHealthy(pod)
+				nodeClaim := Env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
+				node := Env.ExpectCreatedNodeCount("==", 1)[0]
+				Expect(node.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeOnDemand))
+				Expect(Env.GetInstance(node.Name).CapacityReservationId).To(BeNil())
+
+				NodeClass.Spec.CapacityReservationSelectorTerms = []v1.CapacityReservationSelectorTerm{{ID: cr.ID}}
+				Env.ExpectUpdated(NodeClass)
+				enableMigration()
+				expectMigrated(nodeClaim, node, cr.ID)
+			})
+			It("should not migrate a node whose pods require on-demand capacity", func() {
+				enableMigration()
+				cr := Env.ExpectCapacityReservationCreated(1)
+				DeferCleanup(func() {
+					environmentaws.ExpectCapacityReservationsCanceled(Env.Context, Env.EC2API, cr.ID)
+				})
+				NodeClass.Spec.CapacityReservationSelectorTerms = []v1.CapacityReservationSelectorTerm{{ID: cr.ID}}
+				pod := test.Pod(test.PodOptions{NodeRequirements: offeringRequirements(cr, karpv1.CapacityTypeOnDemand)})
+				Env.ExpectCreated(NodePool, NodeClass, pod)
+				Env.EventuallyExpectHealthy(pod)
+				nodeClaim := Env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
+				node := Env.ExpectCreatedNodeCount("==", 1)[0]
+				instanceID := Env.ExpectParsedProviderID(node.Spec.ProviderID)
+
+				// Start the window only once the reservation is selectable, so it spans several migration passes.
+				Eventually(func(g Gomega) {
+					g.Expect(Env.Client.Get(Env, client.ObjectKeyFromObject(NodeClass), NodeClass)).To(Succeed())
+					g.Expect(NodeClass.Status.CapacityReservations).To(ContainElement(HaveField("ID", cr.ID)))
+				}).Should(Succeed())
+				Consistently(func(g Gomega) {
+					nc := &karpv1.NodeClaim{}
+					g.Expect(Env.Client.Get(Env, client.ObjectKeyFromObject(nodeClaim), nc)).To(Succeed())
+					g.Expect(nc.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeOnDemand))
+					g.Expect(nc.Labels).ToNot(HaveKey(v1.LabelCapacityReservationID))
+					g.Expect(nc.Annotations).ToNot(HaveKey(v1.AnnotationCapacityReservationMigrationTarget))
+
+					n := &corev1.Node{}
+					g.Expect(Env.Client.Get(Env, client.ObjectKeyFromObject(node), n)).To(Succeed())
+					g.Expect(n.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeOnDemand))
+					g.Expect(n.Labels).ToNot(HaveKey(v1.LabelCapacityReservationID))
+
+					instance := describeInstance(g, instanceID)
+					g.Expect(instance.CapacityReservationId).To(BeNil())
+					g.Expect(instance.CapacityReservationSpecification).ToNot(BeNil())
+					g.Expect(instance.CapacityReservationSpecification.CapacityReservationTarget).To(BeNil())
+				}, 3*time.Minute, 10*time.Second).Should(Succeed())
+			})
+			It("should re-target an orphaned node into another selected capacity reservation in place", func() {
+				crs := Env.ExpectMatchingCapacityReservationsCreated(2, 1)
+				source, target := crs[0], crs[1]
+				uncanceled := []string{source.ID, target.ID}
+				DeferCleanup(func() {
+					environmentaws.ExpectCapacityReservationsCanceled(Env.Context, Env.EC2API, uncanceled...)
+				})
+				NodeClass.Spec.CapacityReservationSelectorTerms = []v1.CapacityReservationSelectorTerm{{ID: source.ID}}
+				// Keeps the node from being replaced while it is briefly on-demand between cancellation and migration.
+				pod := test.Pod(test.PodOptions{
+					ObjectMeta:       metav1.ObjectMeta{Annotations: map[string]string{karpv1.DoNotDisruptAnnotationKey: "true"}},
+					NodeRequirements: offeringRequirements(source, karpv1.CapacityTypeReserved),
+				})
+				Env.ExpectCreated(NodePool, NodeClass, pod)
+				Env.EventuallyExpectHealthy(pod)
+				nodeClaim := Env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
+				node := Env.ExpectCreatedNodeCount("==", 1)[0]
+				Expect(node.Labels).To(HaveKeyWithValue(v1.LabelCapacityReservationID, source.ID))
+
+				NodeClass.Spec.CapacityReservationSelectorTerms = append(NodeClass.Spec.CapacityReservationSelectorTerms, v1.CapacityReservationSelectorTerm{ID: target.ID})
+				Env.ExpectUpdated(NodeClass)
+				enableMigration()
+				environmentaws.ExpectCapacityReservationsCanceled(Env.Context, Env.EC2API, source.ID)
+				uncanceled = []string{target.ID}
+				expectMigrated(nodeClaim, node, target.ID)
 			})
 		})
 

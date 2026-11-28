@@ -41,10 +41,12 @@ var _ = Describe("capacityTypeFromInstance", func() {
 			},
 		}
 	}
-	It("should treat a re-targeted, covered instance as reserved whether or not the migration gate is on", func() {
-		Expect(capacityTypeFromInstance(gatedCtx(true), targeted("cr-1", lo.ToPtr("cr-1")))).To(Equal(karpv1.CapacityTypeReserved))
-		// Migration is one-way; turning the gate off must not demote nodes EC2 still covers.
-		Expect(capacityTypeFromInstance(gatedCtx(false), targeted("cr-1", lo.ToPtr("cr-1")))).To(Equal(karpv1.CapacityTypeReserved))
+	// Releases without this classification require capacity-reservations-only and report these instances on-demand.
+	It("should classify a target-only instance covered by its target as reserved with the migration gate on or off (version skew)", func() {
+		i := targeted("cr-1", lo.ToPtr("cr-1"))
+		Expect(i.CapacityReservationSpecification.CapacityReservationPreference).To(BeEmpty())
+		Expect(capacityTypeFromInstance(gatedCtx(true), i)).To(Equal(karpv1.CapacityTypeReserved))
+		Expect(capacityTypeFromInstance(gatedCtx(false), i)).To(Equal(karpv1.CapacityTypeReserved))
 	})
 	It("should treat a re-targeted instance that isn't covered yet as on-demand", func() {
 		Expect(capacityTypeFromInstance(gatedCtx(true), targeted("cr-1", nil))).To(Equal(karpv1.CapacityTypeOnDemand))
